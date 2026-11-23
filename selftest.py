@@ -10,6 +10,7 @@ M2 物理部分是纯逻辑，只操作 Player + Rect，不读键盘、不画图
 
 import pygame
 
+import assets
 import config
 import player
 import scenes
@@ -390,6 +391,148 @@ def test_physics():
     test_jump_20()
 
 
+# ---------------------------------------------------------------- M2.5 角色动画
+
+def test_sprites():
+    _section(u"角色贴图（素材接入）")
+
+    hero = assets.load_hero()
+    _check(u"三类动作齐全",
+           sorted(hero.frames.keys()) == ["idle", "jump", "run"],
+           u"、".join(sorted(hero.frames.keys())))
+    _check(u"跑步 8 帧", hero.frame_count("run", -1) == 8,
+           u"%d 帧" % hero.frame_count("run", -1))
+    _check(u"左右朝向都有",
+           all(len(hero.frames[a]) == 2 for a in hero.frames),
+           u"每个动作 2 个朝向")
+
+    # 缩放定标：站立帧缩放到目标高度，误差应在 2px 内
+    stand = hero.frame("idle", -1, 0)
+    real_h = stand.get_bounding_rect().height
+    _check(u"站立帧缩放到位",
+           abs(real_h - assets.HERO_TARGET_HEIGHT) <= 2.0,
+           u"目标 %.0f 实测 %d" % (assets.HERO_TARGET_HEIGHT, real_h))
+    _check(u"与碰撞盒同高",
+           abs(real_h - player.Player.HEIGHT) <= 3.0,
+           u"贴图 %d / 碰撞盒 %d" % (real_h, player.Player.HEIGHT))
+
+    # land.png 实测是地砖，绝不能混进角色帧
+    all_rel = []
+    for sides in assets.hero_anim_specs().values():
+        for rels in sides.values():
+            all_rel.extend(rels)
+    _check(u"land.png 未被当角色帧",
+           not any("land.png" in r for r in all_rel),
+           u"共 %d 个角色帧文件" % len(all_rel))
+
+    # 像素级验证「脚底真的贴地」：锚点算出的脚底位置必须等于不透明像素
+    # 的底边。差 1px 是 smoothscale 把半透明边缘扩了一格，可接受。
+    worst = 0
+    worst_name = ""
+    for action in ("idle", "run", "jump"):
+        n = hero.frame_count(action, -1)
+        for i in range(n):
+            img = hero.frame(action, -1, i)
+            box = img.get_bounding_rect()
+            diff = abs(hero.foot_offset(action, -1, i) - box.bottom)
+            if diff > worst:
+                worst, worst_name = diff, "%s#%d" % (action, i)
+    _check(u"每帧脚底贴地", worst <= 1,
+           u"最大偏差 %dpx（%s）" % (worst, worst_name or u"无"))
+
+    # 缺素材必须抛 AssetMissing（降级路径的触发条件）
+    thrown = False
+    try:
+        assets.image("images/hero/__not_here__.png")
+    except assets.AssetMissing:
+        thrown = True
+    _check(u"缺素材抛 AssetMissing", thrown, u"GameScene 据此退回代码绘制")
+
+
+def test_anim_state():
+    _section(u"动画状态机")
+
+    hero = assets.load_hero()
+    solids = _flat()
+    p = player.Player(200, 460 - player.Player.HEIGHT)
+    _land(p, solids, 4)
+    _check(u"静止播 idle", p.anim_state == "idle", p.anim_state)
+
+    # 按住右跑：状态切 run，相位随位移累加
+    inp = player.InputState()
+    inp.axis = 1.0
+    p.update(DT, inp, solids)
+    p.update(DT, inp, solids)          # 前两帧用来切状态，相位归零
+    expected = p.anim_phase
+    for _ in range(28):
+        p.update(DT, inp, solids)
+        expected += abs(p.vx) * DT / config.RUN_STRIDE_PX
+    _check(u"跑动播 run", p.anim_state == "run", p.anim_state)
+    _check(u"相位与位移同步",
+           abs(p.anim_phase - expected) < 0.5,
+           u"实测 %.2f 期望 %.2f" % (p.anim_phase, expected))
+    _check(u"跑满一轮有换帧",
+           p.anim_frame >= 8,
+           u"帧号 %d（8 帧一轮，已跨轮）" % p.anim_frame)
+
+    # 帧号取模后必须落在合法区间
+    count = hero.frame_count("run", p.facing)
+    idx = p.anim_frame % count
+    _check(u"帧索引不越界", 0 <= idx < count, u"index=%d / %d" % (idx, count))
+
+    # 朝向：往左跑用左向贴图
+    inp2 = player.InputState()
+    inp2.axis = -1.0
+    for _ in range(10):
+        p.update(DT, inp2, solids)
+    _check(u"朝左用左向帧", p.facing == -1, u"facing=%d" % p.facing)
+    left_img = hero.frame(p.anim_state, p.facing,
+                          p.anim_frame % hero.frame_count(p.anim_state, p.facing))
+    _check(u"左向帧可取到", left_img is not None,
+           u"%dx%d" % left_img.get_size())
+
+    # 起跳切 jump，空中保持
+    inp3 = player.InputState()
+    inp3.jump_pressed = True
+    inp3.jump_held = True
+    p.update(DT, inp3, solids)
+    _check(u"起跳播 jump", p.anim_state == "jump", p.anim_state)
+    for _ in range(10):
+        p.update(DT, inp3, solids)
+    _check(u"空中保持 jump", p.anim_state == "jump" and not p.on_ground,
+           u"on_ground=%s" % p.on_ground)
+
+    # 落回地面后必须脱离 jump，回到 idle/run
+    for _ in range(80):
+        p.update(DT, inp3, solids)
+    _check(u"落地退出 jump", p.on_ground and p.anim_state != "jump",
+           u"state=%s" % p.anim_state)
+
+
+def test_land_feel():
+    _section(u"落地反馈")
+
+    solids = _flat()
+    p = player.Player(200, 460 - player.Player.HEIGHT)
+    _land(p, solids, 4)
+
+    inp = player.InputState()
+    inp.jump_pressed = True
+    inp.jump_held = True
+    p.update(DT, inp, solids)
+    flew = 0
+    while not p.on_ground and flew < 120:
+        p.update(DT, inp, solids)
+        flew += 1
+    _check(u"跳起后能落回", p.on_ground and flew < 120, u"滞空 %d 帧" % flew)
+
+    sink = p.land_sink
+    _check(u"落地有下沉反馈", sink > 0.5, u"下沉 %.2f px" % sink)
+    for _ in range(8):
+        p.update(DT, player.InputState(), solids)
+    _check(u"下沉自动回弹", p.land_sink < 0.01, u"%.3f px" % p.land_sink)
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -398,6 +541,9 @@ def run(app):
     print("=" * 60)
 
     test_scenes(app)
+    test_sprites()
+    test_anim_state()
+    test_land_feel()
     test_physics()
 
     fails = len([r for r in RESULTS if not r[0]])

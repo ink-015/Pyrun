@@ -55,6 +55,19 @@ AIR_ACCEL = 1500.0
 COYOTE_TIME = 0.10
 JUMP_BUFFER_TIME = 0.12
 LAND_SQUASH_TIME = 0.08
+
+# ---------- 角色动画（M2.5 接入素材） ----------
+# 跑步帧按位移推进，不按时间：每走这么多像素换一帧。
+# 8 帧 ÷ (300px/s ÷ 15.75px) ≈ 0.42s 一轮，是常见跑步循环节奏。
+RUN_STRIDE_PX = 15.75
+# 低于这个速度算"站着"，否则减速末段会播成慢动作迈腿
+RUN_ANIM_MIN_SPEED = 25.0
+# 落地反馈：整体下沉这么多像素再弹回（素材没有落地帧，用位移代替）
+LAND_SINK_PX = 3.0
+# 贴图锚点：canvas = 画布底边贴地（保留作者画的跑步起伏）
+#           content = 内容底边贴地（每帧强制脚落地，起伏被抹平）
+HERO_ANCHOR = "content"
+
 GLIDE_FALL_SPEED = 120.0
 GLIDE_RUN_SPEED = 330.0
 DASH_SPEED = 560.0

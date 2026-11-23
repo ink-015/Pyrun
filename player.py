@@ -64,6 +64,13 @@ class Player(object):
         self.land_timer = 0.0
         self.jump_count = 0
 
+        # ---- 动画状态（纯逻辑，不持有任何 Surface）----
+        self.anim_state = "idle"    # idle / run / jump
+        self.anim_frame = 0
+        self.anim_phase = 0.0       # 跑步用位移累加，避免速度变化时打滑
+        self.anim_time = 0.0
+        
+
     # ---------------------------------------------------------------- 几何
     @property
     def rect(self):
@@ -72,6 +79,11 @@ class Player(object):
 
     # ---------------------------------------------------------------- 主更新
     def update(self, dt, inp, solids):
+        # 记住"进来时是否在空中"。落地反馈必须靠这个差值判断，
+        # 不能用 self.on_ground 现查：_move_vertical 内部已经把
+        # on_ground 置 True 了，事后再判 if not on_ground 永远为假。
+        was_grounded = self.on_ground
+
         # 1. 土狼时间：在地面时恒为满，离地后开始倒计时
         if self.on_ground:
             self.coyote = config.COYOTE_TIME
@@ -135,7 +147,7 @@ class Player(object):
             if top is not None:
                 self.y = top - self.HEIGHT
                 self.vy = 0.0
-                if not self.on_ground:
+                if not was_grounded:
                     self.land_timer = config.LAND_SQUASH_TIME
                 self.on_ground = True
                 self.jumping = False
@@ -144,6 +156,50 @@ class Player(object):
 
         if self.land_timer > 0.0:
             self.land_timer = max(0.0, self.land_timer - dt)
+
+        # 11. 动画状态：只算「处于什么动作」和「第几帧」，不碰任何贴图
+        self._update_anim(dt)
+
+    # ---------------------------------------------------------------- 动画
+    def _update_anim(self, dt):
+        """推进动画相位。
+
+        这里刻意不知道素材有几帧：anim_frame 只是累加出来的整数相位，
+        由渲染层对它取模。替换素材（帧数变化）不需要改物理代码。
+
+        跑步帧按**水平位移**推进而不是按时间，这样：
+          - 速度越快步频越快，看着不会"滑步"
+          - 减速时脚步自然变慢，而不是保持匀速迈腿
+        """
+        if not self.on_ground:
+            state = "jump"
+        elif abs(self.vx) > config.RUN_ANIM_MIN_SPEED:
+            state = "run"
+        else:
+            state = "idle"
+
+        if state != self.anim_state:
+            if state == "run":
+                self.anim_phase = 0.0   # 重新起跑从第一帧开始，不接着上次相位
+            self.anim_state = state
+
+        if state == "run":
+            self.anim_phase += abs(self.vx) * dt / config.RUN_STRIDE_PX
+            self.anim_frame = int(self.anim_phase)
+        else:
+            self.anim_frame = 0
+
+    @property
+    def land_sink(self):
+        """落地瞬间的下沉量（像素），用于纯 blit 偏移的落地反馈。
+
+        素材里没有落地帧，`land.png` 实测是块地砖，不能当角色用。
+        这里改用"整体下沉再回弹"，不需要额外贴图也不改缩放尺寸。
+        """
+        if self.land_timer <= 0.0 or config.LAND_SQUASH_TIME <= 0.0:
+            return 0.0
+        t = self.land_timer / config.LAND_SQUASH_TIME     # 1 -> 0
+        return config.LAND_SINK_PX * t * t
 
     # ---------------------------------------------------------------- 碰撞
     def _move_horizontal(self, dx, solids):
@@ -207,4 +263,6 @@ class Player(object):
             "state %s  coyote %.3f  buf %.3f"
             % ("GROUND" if self.on_ground else "AIR", self.coyote, self.jump_buffer),
             "jumps %d  facing %+d" % (self.jump_count, self.facing),
+            "anim %s #%d  phase %.2f"
+            % (self.anim_state, self.anim_frame, self.anim_phase),
         ]

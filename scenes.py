@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""场景系统：Scene 基类、SceneManager、菜单场景与游戏场景占位。
+"""场景系统：Scene 基类、SceneManager、菜单场景与游戏场景。
 
-M1 的边界（README §19 M1）：
+M1 定下的边界（README §19 M1）：
   - 窗口只在 main.py 创建一次，场景**只接收 surface**，绝不调用 set_mode
-  - 不依赖任何外部图片或音频，全部用 compat 绘制 + 系统字体
   - 场景切换延迟到帧末执行，避免在事件循环中途替换自身导致状态错乱
+  - 素材缺失时必须能退回纯代码绘制，不能因为少一张图就打不开
 
-M1 之后本文件继续长大（Pause / Result 等），但这两个接口不变：
+M2.5 起游戏场景接入角色贴图动画，但保留 draw_stick_figure 作为降级路径。
+
+两个永不改变的接口：
   Scene.handle_event / update / draw
   SceneManager.register / start / goto
 """
@@ -15,49 +17,21 @@ import os
 
 import pygame
 
+import assets
 import compat
 import config
 import player
 
 # ---------------------------------------------------------------- 字体
 
-_FONT_CACHE = {}
-
 
 def get_font(size, bold=False):
     """按文件路径探测中文字体，带缓存。
 
     返回 (font, 字体文件名)，文件名用于启动日志。
-    M5 做 assets.py 后这里会迁走，届时本函数只保留转发。
+    实际探测逻辑已迁到 assets.font，这里只做转发，避免两处各存一份缓存。
     """
-    key = (size, bool(bold))
-    hit = _FONT_CACHE.get(key)
-    if hit is not None:
-        return hit
-
-    font = None
-    name = "default"
-    for folder in config.FONT_DIRS:
-        for fn in config.FONT_CANDIDATES:
-            path = os.path.join(folder, fn)
-            if not os.path.isfile(path):
-                continue
-            try:
-                font = pygame.font.Font(path, size)
-                font.set_bold(bold)
-                name = fn
-                break
-            except Exception:
-                continue
-        if font is not None:
-            break
-
-    if font is None:
-        font = pygame.font.Font(None, size)
-        font.set_bold(bold)
-
-    _FONT_CACHE[key] = (font, name)
-    return _FONT_CACHE[key]
+    return assets.font(size, bold)
 
 
 # ---------------------------------------------------------------- 背景工具
@@ -343,6 +317,12 @@ class GameScene(Scene):
         self.show_debug = True
         self._focused = True
         self._bg = None
+        self.sprites = None       # assets.HeroSprites；None 表示退回代码绘制
+        self.sprite_error = ""
+        # 非 None 时屏蔽键盘、直接采用这个轴值。
+        # 无头截图和以后的录像回放都依赖它——否则 update() 每帧都会用
+        # key.get_pressed() 覆盖外部写入的输入，自动化根本驱动不了角色。
+        self.override_axis = None
 
     def on_enter(self):
         self.solids = self._build_solids()
@@ -352,6 +332,19 @@ class GameScene(Scene):
         self._focused = True
         self._bg = pygame.Surface((config.WIDTH, config.HEIGHT))
         draw_paper(self._bg)
+        self._load_sprites()
+
+    def _load_sprites(self):
+        """加载角色贴图。失败不抛，退回代码绘制——M1 定下的底线不能破。"""
+        if self.sprites is not None:
+            return
+        try:
+            self.sprites = assets.load_hero()
+            print(u" 角色贴图 : %s" % self.sprites.describe())
+        except assets.AssetMissing as exc:
+            self.sprites = None
+            self.sprite_error = str(exc)
+            print(u" 角色贴图 : 缺失，退回代码绘制（%s）" % exc)
 
     def on_exit(self):
         self._bg = None
@@ -398,7 +391,9 @@ class GameScene(Scene):
             self._focused = True
 
     def update(self, dt):
-        if self._focused:
+        if self.override_axis is not None:
+            self.input.axis = self.override_axis
+        elif self._focused:
             keys = pygame.key.get_pressed()
             axis = 0.0
             if keys[pygame.K_a] or keys[pygame.K_LEFT]:
@@ -418,9 +413,7 @@ class GameScene(Scene):
     def draw(self, surface):
         surface.blit(self._bg, (0, 0))
         self._draw_solids(surface)
-
-        p = self.player
-        draw_stick_figure(surface, p.rect.centerx, p.rect.bottom)
+        self._draw_player(surface)
 
         if self.show_debug:
             self._draw_debug(surface)
@@ -429,6 +422,27 @@ class GameScene(Scene):
         hint = u"← → / A D 移动     空格 跳跃     F1 调试     Esc 返回菜单"
         surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
                      (24, config.HEIGHT - 28))
+
+    def _draw_player(self, surface):
+        """画角色：优先贴图动画，素材缺失时退回代码火柴人。
+
+        锚点约定（见 assets.HeroSprites 文档）：
+          水平 画布中心 -> 碰撞盒中心
+          竖直 画布底边 -> 碰撞盒底边
+        再叠加落地瞬间的整体下沉，做出"踩实"的反馈。
+        """
+        p = self.player
+        if self.sprites is None:
+            draw_stick_figure(surface, p.rect.centerx, p.rect.bottom)
+            return
+
+        count = self.sprites.frame_count(p.anim_state, p.facing)
+        idx = p.anim_frame % count
+        img = self.sprites.frame(p.anim_state, p.facing, idx)
+        x, y = self.sprites.blit_pos(p.rect.centerx,
+                                     p.rect.bottom + int(round(p.land_sink)),
+                                     p.anim_state, p.facing, idx)
+        surface.blit(img, (x, y))
 
     def _draw_solids(self, surface):
         for s in self.solids:

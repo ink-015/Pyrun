@@ -6,12 +6,16 @@
 
 M1 内容：固定步长主循环 + 场景管理 + 菜单/游戏两个场景。
 M2 内容：游戏场景接入玩家物理、灰盒地形与 F1 调试显示。
+M2.5 内容：角色贴图动画（assets.py），素材缺失时退回代码绘制。
 命令行开关：
     python main.py                 正常启动，进主菜单
     python main.py --smoke         渲染一帧菜单并截图，用于环境验证
-    python main.py --smoke-game    跳到游戏场景渲染一帧并截图
+    python main.py --smoke-game    跳到游戏场景跑几步并截图
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
-    python main.py --selftest      运行分阶段自检（M1 场景 + M2 物理）
+    python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
+    python main.py --smoke-run     连续截取跑动帧拼成一条，判断动作连贯性
+                                   （可选第二参数 canvas / content 对比锚点）
+    python main.py --selftest      运行分阶段自检（场景 + 贴图 + 动画 + 物理）
     python main.py --bench 180 game   帧率基准，第二个参数可指定场景
     python main.py --fps           运行时在控制台打印实际帧率
 """
@@ -23,8 +27,10 @@ import time
 
 import pygame
 
+import assets
 import compat
 import config
+import player
 import scenes
 import selftest
 
@@ -124,6 +130,77 @@ def save_screenshot(surface, name):
     out = os.path.join(config.DOCS_DIR, name)
     pygame.image.save(surface, out)
     return out
+
+
+def run_smoke_anim(app):
+    """把角色各动作按**游戏内真实比例**摊开画一遍，用于核对锚点。
+
+    为什么必须单独做这一张：素材每帧在自己的画布内是有上下起伏的
+    （跑动帧脚底距画布底边 0~18px，那是作者的弹跳节奏）。锚点选错时
+    在动图上很难看出来，但摊在一条地面线上就一目了然——
+    脚是贴着线跑，还是整个人在地上蹦。
+    """
+    screen = app.screen
+    screen.fill(config.COLOR_PAPER)
+    for x in range(0, config.WIDTH, 64):
+        pygame.draw.line(screen, config.COLOR_PAPER_LINE, (x, 0), (x, config.HEIGHT))
+    for y in range(0, config.HEIGHT, 64):
+        pygame.draw.line(screen, config.COLOR_PAPER_LINE, (0, y), (config.WIDTH, y))
+
+    try:
+        hero = assets.load_hero()
+    except assets.AssetMissing as exc:
+        print(u" 角色贴图缺失：%s" % exc)
+        return 1
+
+    f, _ = scenes.get_font(14)
+
+    def ground(y, note):
+        pygame.draw.line(screen, config.COLOR_INK, (0, y), (config.WIDTH, y), 2)
+        screen.blit(f.render(note, True, config.COLOR_MUTED), (8, y - 20))
+
+    def put(img, cx, foot_y, action, facing, idx):
+        # 走和游戏里完全相同的锚点计算，避免"检查图好看、进游戏却错位"
+        x, y = hero.blit_pos(cx, foot_y, action, facing, idx)
+        screen.blit(img, (x, y))
+
+    # 上排：8 帧跑步，铺在同一水平线上
+    g1 = 300
+    ground(g1, u"run x8  (%d 帧)" % hero.frame_count("run", -1))
+    run = hero.frames["run"][-1]
+    for i, img in enumerate(run):
+        cx = 70 + i * 112
+        put(img, cx, g1, "run", -1, i)
+        lb = f.render("run%d" % i, True, config.COLOR_MUTED)
+        screen.blit(lb, (cx - lb.get_width() // 2, g1 + 4))
+
+    # 左下：站立与跳跃两种朝向
+    g2 = 500
+    ground(g2, u"idle / jump")
+    idle_l = hero.frame("idle", -1, 0)
+    idle_r = hero.frame("idle", 1, 0)
+    jump_l = hero.frame("jump", -1, 0)
+    jump_r = hero.frame("jump", 1, 0)
+    put(idle_l, 90, g2, "idle", -1, 0)
+    put(idle_r, 220, g2, "idle", 1, 0)
+    put(jump_l, 360, g2, "jump", -1, 0)
+    put(jump_r, 490, g2, "jump", 1, 0)
+    for cx, name in ((90, "idle L"), (220, "idle R"), (360, "jump L"), (490, "jump R")):
+        lb = f.render(name, True, config.COLOR_MUTED)
+        screen.blit(lb, (cx - lb.get_width() // 2, g2 + 4))
+
+    # 右下：碰撞盒与贴图的对齐检查
+    box = pygame.Rect(0, 0, player.Player.WIDTH, player.Player.HEIGHT)
+    box.center = (760, g2 - player.Player.HEIGHT // 2)
+    put(idle_l, 760, g2, "idle", -1, 0)
+    pygame.draw.rect(screen, (200, 60, 60), box, 1)
+    lb = f.render(u"26x70 hitbox", True, config.COLOR_MUTED)
+    screen.blit(lb, (760 - lb.get_width() // 2, g2 + 4))
+
+    out = save_screenshot(screen, "hero_ingame.png")
+    print(u" 角色     : %s" % hero.describe())
+    print(u" 截图     : %s" % out)
+    return 0
 
 
 def run_bench(app, frames):
@@ -227,18 +304,79 @@ def main():
         return 0
 
     if "--smoke-game" in sys.argv:
-        # 直接跳到游戏场景，跑 20 步让玩家落稳，再截图
+        # 跳到游戏场景：先落稳，再按住左跑一小段（左侧无遮挡），
+        # 确保画面里是跑动帧而不是站立帧
         app.scenes.start("game")
+        scene = app.scenes.current
         for _ in range(20):
+            app.scenes.update(config.FIXED_DT)
+        scene.override_axis = -1.0
+        for _ in range(14):
             app.scenes.update(config.FIXED_DT)
         app.scenes.draw(screen)
         pygame.display.flip()
+        print(u" 动画状态 : %s #%d" % (scene.player.anim_state, scene.player.anim_frame))
         print(" 截图   :", save_screenshot(screen, "m2_game.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-run" in sys.argv:
+        # 连续截取跑动中的角色，拼成一条，用于肉眼判断动作是否连贯。
+        # 这里刻意用纯平地面而不是 GameScene 的灰盒地形：
+        # 灰盒地形在 x=170 就有平台侧面会挡住角色，跑到一半会停下来，
+        # 看不出整轮跑步循环。
+        # 用 --smoke-run content 可以生成另一种锚点的对照图。
+        anchor = "canvas"
+        i = sys.argv.index("--smoke-run")
+        if i + 1 < len(sys.argv) and sys.argv[i + 1] in ("canvas", "content"):
+            anchor = sys.argv[i + 1]
+        hero = assets.load_hero(anchor=anchor)
+        solids = [pygame.Rect(-4000, 460, 8000, 80)]
+        p = player.Player(0, 460 - player.Player.HEIGHT)
+        inp = player.InputState()
+        inp.axis = 1.0
+        for _ in range(6):                  # 先落稳并加速到跑速
+            p.update(config.FIXED_DT, inp, solids)
+
+        gw, gh = 96, 112
+        frames = 10
+        strip = pygame.Surface((gw * frames, gh))
+        strip.fill(config.COLOR_PAPER)
+        count = 1
+        for i in range(frames):
+            for _ in range(3):              # 每 3 帧取一格，一轮约 25 帧
+                p.update(config.FIXED_DT, inp, solids)
+            cell = pygame.Surface((gw, gh))
+            cell.fill(config.COLOR_PAPER)
+            pygame.draw.line(cell, config.COLOR_INK, (0, gh - 12), (gw, gh - 12), 2)
+            count = hero.frame_count(p.anim_state, p.facing)
+            idx = p.anim_frame % count
+            img = hero.frame(p.anim_state, p.facing, idx)
+            x, y = hero.blit_pos(gw // 2, gh - 12, p.anim_state, p.facing, idx)
+            cell.blit(img, (x, y))
+            strip.blit(cell, (i * gw, 0))
+            pygame.draw.line(strip, (230, 226, 216), (i * gw, 0), (i * gw, gh), 1)
+
+        f, _ = scenes.get_font(13)
+        strip2 = pygame.Surface((gw * frames, gh + 20))
+        strip2.fill(config.COLOR_PAPER)
+        strip2.blit(strip, (0, 0))
+        strip2.blit(f.render(u"anchor=%s, %d frames, every 3 ticks" % (anchor, count),
+                             True, config.COLOR_MUTED), (6, gh + 2))
+        name = "hero_run_strip.png" if anchor == "canvas" else "hero_run_strip_content.png"
+        out = save_screenshot(strip2, name)
+        print(u" 动画状态 : %s 帧数 %d 锚点 %s" % (p.anim_state, count, anchor))
+        print(" 截图   :", out)
         pygame.quit()
         return 0
 
     if "--selftest" in sys.argv:
         code = selftest.run(app)
+        pygame.quit()
+        return code
+
+    if "--smoke-anim" in sys.argv:
+        code = run_smoke_anim(app)
         pygame.quit()
         return code
 
