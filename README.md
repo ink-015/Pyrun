@@ -46,6 +46,12 @@
 
 > ⚠️ **pygame 1.9.6 API 边界**（实测，2026-11-23）：没有 `draw.rect(border_radius=)`、没有 `Rect.clipline()`、没有 `pygame.SCALED`、没有 `math.dist`。圆角面板、线段裁剪、距离计算统一走 `compat.py`，业务代码里禁止直接调用这些新 API。另：无头模式下 `set_mode` 默认返回 **8 位调色板表面**（文字变实心块、透明贴图贴不上），必须显式传 `depth=32`，`compat.make_display()` 已封装。
 
+> ⚠️ **Windows 默认编码是 GBK**：`open()` 读 UTF-8 中文会抛 `UnicodeDecodeError`。读写文本一律走 `io_utils`。
+>
+> 完整的环境事实、已修复问题、潜伏问题与预防方案见 **[docs/环境适配说明.md](docs/环境适配说明.md)**；改动代码前先跑 `python tools/envcheck.py`（18 项自检）。
+
+**三条硬规则**：① 建窗口只调 `compat.make_display()`；② 画圆角/裁剪/距离只调 `compat.*`；③ 读写文本只调 `io_utils.*`。
+
 ---
 
 ## 2. 美术方向：为什么这套素材能撑住
@@ -403,6 +409,7 @@
 ├── main.py            入口：初始化、主循环、场景切换
 ├── config.py          所有常量与手感参数（唯一调参入口）
 ├── compat.py          pygame 1.9.6 兼容层（圆角矩形/裁剪/染色/创建窗口）
+├── io_utils.py        UTF-8 文件与 JSON 读写（禁止直接 open 文本）
 ├── assets.py          资源加载与缓存（图片预缩放、染色、字体、音效）
 ├── sketch.py          手绘风格绘制工具（抖动矩形/圆/线、粒子）
 ├── player.py          玩家状态机 + 物理
@@ -425,6 +432,8 @@
 │   └── audio/
 │       ├── footsteps/ impacts/ ui/ items/ music/
 ├── docs/              示意图与开发记录
+├── docs/环境适配说明.md  环境坑与预防方案（改动前必读）
+├── tools/envcheck.py  环境体检脚本（每个里程碑前跑一次）
 ├── README.md          项目主文档（放在根目录）
 └── 素材清单.md        素材路径与用途（放在根目录）
 ```
@@ -515,7 +524,11 @@ IDLE ──按方向──→ RUN ──离地──→ JUMP ──vy>0──→
 | 风险 | 概率 | 备选 |
 |---|---|---|
 | **（已发生，已处置）** 海龟编辑器 pygame 只有 1.9.6 | 高 | 已实测确认：`border_radius` / `Rect.clipline` / `SCALED` / `math.dist` 全部缺失。统一走 `compat.py`：`rounded_rect()`、`panel()`、`clip_line()`、`dist()`、`tint()`、`make_display()` |
-| **（已发生，已处置）** 无头模式显示面 8 位 | 高 | `set_mode` 显式 `depth=32`；游戏内也要用 `compat.make_display()`，不要直接调 `pygame.display.set_mode` |
+| **（已发生，已处置）** 无头模式显示面 8 位 | 高 | `set_mode` 显式 `depth=32`；统一用 `compat.make_display()` |
+| **（潜伏·高危）** Windows 默认 GBK，`open()` 读 UTF-8 中文抛 `UnicodeDecodeError` | 高 | 文本读写一律走 `io_utils.read_text/write_text/read_json/write_json`；加载第一关时必然触发 |
+| **（潜伏）** 无音频设备时 `mixer.init()` 抛 `error: No available audio device` | 中 | `try/except` 后置 `audio_enabled=False`，游戏照常运行，只是没声音 |
+| **（潜伏）** SDL 1.2 无 `WINDOWFOCUSLOST`，Alt+Tab 后按键可能卡住 | 中 | 监听 `ACTIVEEVENT` + `event.state & 2`（`APPINPUTFOCUS` 常量也未暴露，手写 `=2`），失焦时清空输入并暂停 |
+| **（潜伏）** `smoothscale` 大图 7.68ms、`panel` 0.75ms | 中 | 缩放只在加载期做；UI 面板渲染一次后缓存复用，禁止每帧重画 |
 | 中文字体找不到（`simkai.ttf`） | 低 | 依次尝试 `simkai.ttf → msyh.ttc → 自带字体 → 英文 UI`；字体路径集中在 `config.py` |
 | OGG 无法播放 | 低 | 提供 `tools/ogg2wav.py` 一键转换，`assets.py` 优先找 `.ogg` 再找 `.wav` |
 | 60 帧掉帧 | 中 | 只渲染视口内瓦片；图片加载时预缩放并缓存；粒子池上限 80 |
@@ -1039,7 +1052,8 @@ README 是否需要更新：
 - [x] 用户已确认第 23 章全部 8 项玩法决策（详见第 23 章）。
 - [x] 按《素材清单》整理实际素材目录（`assets/` 共 124 个文件，883 KB）。
 - [x] 创建 `main.py` / `config.py` / `compat.py` / `requirements.txt` / `.gitignore`，完成 M0 运行测试。
-- [x] **在真正使用海龟编辑器的机器上实测通过**：编辑器路径 `D:\tools\Pyblock`，内置 Python 3.6.5 + pygame 1.9.6，无头（32 位）与真实窗口（windib）均运行成功，24 个 .ogg 音效可加载。
+- [x] **在真正使用海龟编辑器的机器上实测通过**：编辑器路径 `D:\tools\Pyblock`，内置 Python 3.6.5 + pygame 1.9.6，无头（32 位）与真实窗口（windib）均运行成功，29 个 .ogg 音效可加载。
+- [x] 新增 `docs/环境适配说明.md`（环境事实 + 5 个已修复问题 + 6 个潜伏问题 + 预防方案）与 `tools/envcheck.py`（18 项自检，全绿）；新增 `io_utils.py` 堵住 GBK 编码坑。
 
 ### 推荐下一步
 
@@ -1117,6 +1131,7 @@ M1 只做骨架：拆出 `scenes.py` 的 Menu / Game 空场景与场景切换，
 | 2026-11-23 | 根据用户补充的 `火柴人.zip` 修正主角/敌人素材；统一地图出生点 `P`、敌人踩踏规则、死亡计时、素材目录、地砖用途、功能色和 UI 面板规范 |
 | 2026-11-23 | **M0 完成**：素材整理入 `assets/`；新增 `config.py`、`main.py`、`requirements.txt`、`.gitignore`；实测 `tile_*` 无法平铺为连续地面并记入 §3.1；截图 `docs/m0_check.png` |
 | 2026-11-23 | **海龟编辑器实机验证**：确认内置 Python 3.6.5 + pygame 1.9.6（`D:\tools\Pyblock`）；发现无头模式 8 位表面与 `border_radius`/`clipline`/`SCALED`/`math.dist` 缺失，新增 `compat.py` 统一兜底；重跑自检与截图通过，24 个 .ogg 可加载 |
+| 2026-11-23 | **环境适配系统化**：新增 `docs/环境适配说明.md`、`io_utils.py`（UTF-8/JSON 原子读写）、`tools/envcheck.py`（18 项自检）；实测确认 GBK 编码坑、无音频设备报错、SDL1.2 无焦点事件、`smoothscale` 7.68ms 与 `panel` 0.75ms 开销；确立三条硬规则（窗口/图形/文本各走中间层） |
 
 
 ---
