@@ -17,6 +17,7 @@ import pygame
 
 import compat
 import config
+import player
 
 # ---------------------------------------------------------------- 字体
 
@@ -88,20 +89,22 @@ def draw_stick_figure(surface, x, ground_y, scale=1.0, color=None):
     """
     color = color or config.COLOR_INK
     s = scale
-    head_r = int(11 * s)
-    head_cy = ground_y - int(62 * s)
+    # 总高必须等于 Player.HEIGHT（70），否则头顶会戳出红色判定框
+    head_r = int(10 * s)
+    head_cy = ground_y - int(60 * s)
     # 头
     pygame.draw.circle(surface, color, (int(x), head_cy), head_r, max(2, int(3 * s)))
     # 躯干
     neck_y = head_cy + head_r
     hip_y = ground_y - int(28 * s)
     pygame.draw.line(surface, color, (int(x), neck_y), (int(x), hip_y), max(2, int(3 * s)))
-    # 手臂
+    # 手臂。跨度必须小于碰撞盒宽度（26），否则手臂会伸到红色判定框外面，
+    # 看起来像"判定比人还窄"，容易误判手感。
     shoulder_y = neck_y + int(8 * s)
-    pygame.draw.line(surface, color, (int(x - 14 * s), shoulder_y + int(10 * s)),
+    pygame.draw.line(surface, color, (int(x - 11 * s), shoulder_y + int(9 * s)),
                      (int(x), shoulder_y), max(2, int(3 * s)))
     pygame.draw.line(surface, color, (int(x), shoulder_y),
-                     (int(x + 14 * s), shoulder_y + int(10 * s)), max(2, int(3 * s)))
+                     (int(x + 11 * s), shoulder_y + int(9 * s)), max(2, int(3 * s)))
     # 腿
     pygame.draw.line(surface, color, (int(x), hip_y),
                      (int(x - 11 * s), ground_y), max(2, int(3 * s)))
@@ -320,59 +323,126 @@ class MenuScene(Scene):
                      ((config.WIDTH - hw) // 2, config.HEIGHT - 56))
 
 
-# ---------------------------------------------------------------- 游戏场景（占位）
+# ---------------------------------------------------------------- 游戏场景
 
 class GameScene(Scene):
-    """M1 的空壳。M2 起往 update 里塞玩家与物理，往 draw 里塞世界。"""
+    """M2：灰盒地形 + 玩家物理 + 调试显示。
+
+    M3 会把 _build_solids() 换成 levels/l1.txt 的解析结果；
+    在那之前这里的地形是硬编码的，只为验收物理。
+    """
 
     name = "game"
+    GROUND_TOP = 460
 
     def __init__(self, app):
         Scene.__init__(self, app)
-        self.elapsed = 0.0
+        self.player = None
+        self.solids = []
+        self.input = player.InputState()
+        self.show_debug = True
+        self._focused = True
         self._bg = None
 
     def on_enter(self):
-        self.elapsed = 0.0
+        self.solids = self._build_solids()
+        self.player = player.Player(80, self.GROUND_TOP - player.Player.HEIGHT)
+        self.input = player.InputState()
+        self.show_debug = True
+        self._focused = True
         self._bg = pygame.Surface((config.WIDTH, config.HEIGHT))
         draw_paper(self._bg)
 
     def on_exit(self):
         self._bg = None
 
+    def _build_solids(self):
+        """M2 验收用地形：地面 + 三个可跳上的平台 + 一堵堵路矮墙 + 高台。
+
+        矮墙高 80px，而跳跃高度约 126px，所以撞得到也跳得过——
+        既能验收"不能穿墙"，又不会把玩家困死。
+        """
+        return [
+            pygame.Rect(0, self.GROUND_TOP, config.WIDTH, config.HEIGHT - self.GROUND_TOP),
+            pygame.Rect(170, 380, 140, 20),
+            pygame.Rect(380, 330, 140, 20),
+            pygame.Rect(600, 380, 140, 20),
+            pygame.Rect(760, 380, 26, 80),
+            pygame.Rect(850, 290, 100, 20),
+        ]
+
+    # ---- 输入 ----
     def handle_event(self, event):
-        if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
-            self.app.scenes.goto("menu")
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.app.scenes.goto("menu")
+                return
+            if event.key == pygame.K_SPACE:
+                self.input.jump_pressed = True
+                self.input.jump_held = True
+            elif event.key == pygame.K_F1:
+                self.show_debug = not self.show_debug
+        elif event.type == pygame.KEYUP:
+            if event.key == pygame.K_SPACE:
+                self.input.jump_released = True
+                self.input.jump_held = False
+
+        # 失焦必须清空输入，否则回来时角色会一直往一个方向跑
+        if compat.focus_lost(event):
+            self._focused = False
+            self.input.release_edges()
+            self.input.jump_held = False
+            if self.player is not None:
+                self.player.vx = 0.0
+        elif compat.focus_gained(event):
+            self._focused = True
 
     def update(self, dt):
-        self.elapsed += dt
+        if self._focused:
+            keys = pygame.key.get_pressed()
+            axis = 0.0
+            if keys[pygame.K_a] or keys[pygame.K_LEFT]:
+                axis -= 1.0
+            if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+                axis += 1.0
+            self.input.axis = axis
+        else:
+            self.input.axis = 0.0
+
+        self.player.update(dt, self.input, self.solids)
+
+        # 掉出画面先做最简处理，M4 才接正式死亡流程
+        if self.player.y > config.HEIGHT + 160:
+            self.player.reset()
 
     def draw(self, surface):
         surface.blit(self._bg, (0, 0))
+        self._draw_solids(surface)
 
-        ground_y = 420
-        pygame.draw.line(surface, config.COLOR_INK, (0, ground_y), (config.WIDTH, ground_y), 3)
+        p = self.player
+        draw_stick_figure(surface, p.rect.centerx, p.rect.bottom)
 
-        # 占位角色：轻微呼吸起伏，证明 update(dt) 真的在跑
-        bob = int(1.5 * ((self.elapsed * 2) % 2 - 1))
-        draw_stick_figure(surface, config.WIDTH // 2, ground_y + bob)
+        if self.show_debug:
+            self._draw_debug(surface)
 
-        panel = pygame.Rect(0, 0, 460, 132)
-        panel.center = (config.WIDTH // 2, 150)
-        compat.panel(surface, panel, radius=16, fill=(255, 255, 255), width=3)
+        f_hint, _ = get_font(16)
+        hint = u"← → / A D 移动     空格 跳跃     F1 调试     Esc 返回菜单"
+        surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
+                     (24, config.HEIGHT - 28))
 
-        f_big, _ = get_font(30, bold=True)
-        f_small, _ = get_font(18)
-        t1 = u"游戏场景（M1 占位）"
-        t2 = u"场景切换已打通，玩法从 M2 开始接入"
-        t3 = u"Esc 返回菜单"
+    def _draw_solids(self, surface):
+        for s in self.solids:
+            pygame.draw.rect(surface, config.COLOR_GROUND, s)
+            pygame.draw.rect(surface, config.COLOR_INK, s, 2)
 
-        w1 = f_big.size(t1)[0]
-        surface.blit(f_big.render(t1, True, config.COLOR_INK),
-                     ((config.WIDTH - w1) // 2, panel.top + 18))
-        w2 = f_small.size(t2)[0]
-        surface.blit(f_small.render(t2, True, config.COLOR_MUTED),
-                     ((config.WIDTH - w2) // 2, panel.top + 62))
-        w3 = f_small.size(t3)[0]
-        surface.blit(f_small.render(t3, True, config.COLOR_MUTED),
-                     ((config.WIDTH - w3) // 2, panel.top + 92))
+    def _draw_debug(self, surface):
+        f, _ = get_font(15)
+        lines = self.player.debug_lines()
+        box = pygame.Rect(16, 14, 340, 16 + 20 * len(lines))
+        pygame.draw.rect(surface, (255, 255, 255), box)
+        pygame.draw.rect(surface, config.COLOR_INK, box, 2)
+        for i, line in enumerate(lines):
+            surface.blit(f.render(line, True, config.COLOR_INK),
+                         (box.left + 10, box.top + 8 + i * 20))
+        # 碰撞盒线框：红色细线，用来核对视觉与判定是否一致
+        pygame.draw.rect(surface, (200, 60, 60), self.player.rect, 1)

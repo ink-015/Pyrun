@@ -5,11 +5,14 @@
 场景只接收 surface，永远不调用 set_mode。
 
 M1 内容：固定步长主循环 + 场景管理 + 菜单/游戏两个场景。
+M2 内容：游戏场景接入玩家物理、灰盒地形与 F1 调试显示。
 命令行开关：
     python main.py                 正常启动，进主菜单
     python main.py --smoke         渲染一帧菜单并截图，用于环境验证
+    python main.py --smoke-game    跳到游戏场景渲染一帧并截图
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
-    python main.py --selftest      无窗口跑一遍场景切换断言
+    python main.py --selftest      运行分阶段自检（M1 场景 + M2 物理）
+    python main.py --bench 180 game   帧率基准，第二个参数可指定场景
     python main.py --fps           运行时在控制台打印实际帧率
 """
 
@@ -23,6 +26,7 @@ import pygame
 import compat
 import config
 import scenes
+import selftest
 
 
 class App(object):
@@ -112,12 +116,7 @@ def draw_asset_check_frame(screen, font_big, font_small, font_name):
                                   True, config.COLOR_MUTED), (42, 110))
 
 
-# ---------------------------------------------------------------- 自检
-
-def _key_event(key):
-    """构造一个 KEYDOWN 事件，不经过窗口队列，dummy 驱动下也能用。"""
-    return pygame.event.Event(pygame.KEYDOWN, {"key": key, "mod": 0})
-
+# ---------------------------------------------------------------- 截图
 
 def save_screenshot(surface, name):
     """把当前画面存到 docs/，返回完整路径。"""
@@ -125,69 +124,6 @@ def save_screenshot(surface, name):
     out = os.path.join(config.DOCS_DIR, name)
     pygame.image.save(surface, out)
     return out
-
-
-def run_selftest(app):
-    """验证 M1 的四条验收：窗口唯一、退出可用、场景可切换、不读素材。
-
-    返回进程退出码。
-    """
-    results = []
-
-    def check(name, cond, detail=""):
-        results.append((bool(cond), name, detail))
-        print("  [%s] %-22s %s" % ("PASS" if cond else "FAIL", name, detail))
-
-    print("=" * 56)
-    print(" 火柴人跑酷 · M1 场景自检")
-    print("=" * 56)
-
-    check(u"启动进入菜单", app.scenes.current_name == "menu",
-          u"当前=%s" % app.scenes.current_name)
-
-    # 真正渲染一帧，确认 draw 不崩且不读素材
-    app.scenes.draw(app.screen)
-    pygame.display.flip()
-    shot = save_screenshot(app.screen, "m1_menu.png")
-    check(u"菜单可渲染", os.path.isfile(shot), os.path.basename(shot))
-
-    app.scenes.handle_events([_key_event(pygame.K_RETURN)])
-    check(u"Enter 进入游戏", app.scenes.current_name == "game",
-          u"当前=%s" % app.scenes.current_name)
-
-    for _ in range(30):
-        app.scenes.update(config.FIXED_DT)
-    game = app.scenes.current
-    check(u"固定步长生效", abs(game.elapsed - 30 * config.FIXED_DT) < 1e-6,
-          u"elapsed=%.3fs" % game.elapsed)
-
-    app.scenes.draw(app.screen)
-    pygame.display.flip()
-    shot = save_screenshot(app.screen, "m1_game.png")
-    check(u"游戏场景可渲染", os.path.isfile(shot), os.path.basename(shot))
-
-    app.scenes.handle_events([_key_event(pygame.K_ESCAPE)])
-    check(u"Esc 返回菜单", app.scenes.current_name == "menu",
-          u"当前=%s" % app.scenes.current_name)
-
-    menuscene = app.scenes.current
-    app.scenes.handle_events([_key_event(pygame.K_DOWN)])
-    check(u"方向键切换选项", menuscene.index == 1, u"index=%d" % menuscene.index)
-
-    app.scenes.handle_events([_key_event(pygame.K_RETURN)])
-    check(u"退出项可退出", app.running is False, u"running=%s" % app.running)
-
-    check(u"窗口未重复创建", app.screen is not None and app.screen.get_bitsize() == 32,
-          u"%dx%d / %d 位" % (app.screen.get_width(), app.screen.get_height(),
-                              app.screen.get_bitsize()))
-
-    fails = len([r for r in results if not r[0]])
-    print("-" * 56)
-    print(u" 结果：%s（共 %d 项，场景切换 %d 次）"
-          % (u"全部通过" if not fails else u"%d 项失败" % fails,
-             len(results), app.scenes.switch_count))
-    print("-" * 56)
-    return 1 if fails else 0
 
 
 def run_bench(app, frames):
@@ -290,19 +226,35 @@ def main():
         pygame.quit()
         return 0
 
+    if "--smoke-game" in sys.argv:
+        # 直接跳到游戏场景，跑 20 步让玩家落稳，再截图
+        app.scenes.start("game")
+        for _ in range(20):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(" 截图   :", save_screenshot(screen, "m2_game.png"))
+        pygame.quit()
+        return 0
+
     if "--selftest" in sys.argv:
-        code = run_selftest(app)
+        code = selftest.run(app)
         pygame.quit()
         return code
 
     if "--bench" in sys.argv:
         i = sys.argv.index("--bench")
         frames = 180
+        scene = "menu"
         if i + 1 < len(sys.argv):
             try:
                 frames = max(1, int(sys.argv[i + 1]))
             except ValueError:
                 pass
+        if i + 2 < len(sys.argv):
+            scene = sys.argv[i + 2]
+        if scene != "menu":
+            app.scenes.start(scene)
         code = run_bench(app, frames)
         pygame.quit()
         return code
