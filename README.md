@@ -4,7 +4,7 @@
 > 状态：**设计方案已确认；M0 环境验证已通过（Python 3.6.5 / pygame 1.9.6）**
 > 最后更新：2026-11-23
 
-**当前进度**：`✅ 设计` → `✅ M0 环境` → `⬜ M1 骨架` → `⬜ M2 手感` → `⬜ M3 第一关` → `⬜ M4 机关` → `⬜ M5 道具` → `⬜ M6 扩展关卡` → `⬜ M7 UI/存档` → `⬜ M8 打磨`
+**当前进度**：`✅ 设计` → `✅ M0 环境` → `✅ M1 骨架` → `⬜ M2 手感` → `⬜ M3 第一关` → `⬜ M4 机关` → `⬜ M5 道具` → `⬜ M6 扩展关卡` → `⬜ M7 UI/存档` → `⬜ M8 打磨`
 
 当前目录已包含 `main.py`、`config.py`、`compat.py`、`assets/`（124 个素材文件）、`levels/`、`docs/` 与 `tools/`；M0 已在**海龟编辑器真实环境**中验证通过，尚未实现任何玩法。
 
@@ -880,6 +880,13 @@ class GameScene:
 - 主循环不重复初始化窗口。
 - 不依赖任何外部图片或音频。
 
+**✅ 2026-11-23 完成。** 实际落地：
+- `scenes.py`：`Scene` 基类（handle_event / update / draw）、`SceneManager`（注册 + 延迟切换）、`MenuScene`、`GameScene` 占位。
+- `main.py`：固定步长主循环（逻辑 1/60s 一步，渲染帧率可变，卡顿最多追 5 步）。
+- 自检：`python main.py --selftest` 9 项断言（场景切换、固定步长、退出、窗口唯一）。
+- 帧率：`python main.py --bench 180` —— 海龟环境纯渲染 1.72 ms/帧，3.11 环境 1.27 ms/帧，余量充足。
+- 截图：`docs/m1_menu.png`、`docs/m1_game.png`，全部由代码绘制，不读素材。
+
 ### M2：灰盒移动与跳跃
 
 交付：`player.py`、基础碰撞地面、调试显示。
@@ -1132,6 +1139,8 @@ M1 只做骨架：拆出 `scenes.py` 的 Menu / Game 空场景与场景切换，
 | 2026-11-23 | **M0 完成**：素材整理入 `assets/`；新增 `config.py`、`main.py`、`requirements.txt`、`.gitignore`；实测 `tile_*` 无法平铺为连续地面并记入 §3.1；截图 `docs/m0_check.png` |
 | 2026-11-23 | **海龟编辑器实机验证**：确认内置 Python 3.6.5 + pygame 1.9.6（`D:\tools\Pyblock`）；发现无头模式 8 位表面与 `border_radius`/`clipline`/`SCALED`/`math.dist` 缺失，新增 `compat.py` 统一兜底；重跑自检与截图通过，24 个 .ogg 可加载 |
 | 2026-11-23 | **环境适配系统化**：新增 `docs/环境适配说明.md`、`io_utils.py`（UTF-8/JSON 原子读写）、`tools/envcheck.py`（18 项自检）；实测确认 GBK 编码坑、无音频设备报错、SDL1.2 无焦点事件、`smoothscale` 7.68ms 与 `panel` 0.75ms 开销；确立三条硬规则（窗口/图形/文本各走中间层） |
+| 2026-11-23 | **双环境支持**：验证同一份代码在 3.11.9 + pygame 2.6.1 下可运行，两个环境自检各 19 项全绿；修正焦点事件认知（实为三套模型，pygame 2.6 已取消 `WINDOWEVENT`），`compat` 新增 `focus_lost/focus_gained` 按常量能力探测；自检静态扫描按「Python 兼容」与「pygame 2 专有」分档 |
+| 2026-11-23 | **M1 完成**：新增 `scenes.py`（Scene 基类 + SceneManager + MenuScene + GameScene 占位），`main.py` 改为固定步长主循环；`--selftest` 9 项断言全通过，`--bench` 实测纯渲染 1.72ms/帧（海龟）/ 1.27ms（3.11）；截图 `docs/m1_menu.png`、`docs/m1_game.png`，全程不读素材 |
 
 
 ---
