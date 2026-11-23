@@ -1,12 +1,12 @@
 # 《火柴人跑酷》设计与开发文档
 
 > 2D 横版精准平台跳跃（跑酷 + IWANNA 机关）· Python + pygame · 海龟编辑器
-> 状态：**设计方案与 8 项关键玩法决策已确认；尚未开始编码**
+> 状态：**设计方案已确认；M0 环境验证已通过（Python 3.6.5 / pygame 1.9.6）**
 > 最后更新：2026-11-23
 
 **当前进度**：`✅ 设计` → `✅ M0 环境` → `⬜ M1 骨架` → `⬜ M2 手感` → `⬜ M3 第一关` → `⬜ M4 机关` → `⬜ M5 道具` → `⬜ M6 扩展关卡` → `⬜ M7 UI/存档` → `⬜ M8 打磨`
 
-当前目录已包含 `main.py`、`config.py`、`assets/`（124 个素材文件）、`levels/`、`docs/` 与 `tools/`；M0 已完成本地环境验证，尚未实现任何玩法。M1 开始前仍须在实际使用海龟编辑器的机器上确认 Pygame 可安装。
+当前目录已包含 `main.py`、`config.py`、`compat.py`、`assets/`（124 个素材文件）、`levels/`、`docs/` 与 `tools/`；M0 已在**海龟编辑器真实环境**中验证通过，尚未实现任何玩法。
 
 ---
 
@@ -40,9 +40,11 @@
 | 图形/音频 | `pygame` | 海龟编辑器「库管理 → 游戏」可装 Pygame / Pygame Zero |
 | 框架 | **直接用 pygame**，不用 Pygame Zero | 需要精确控制地面检测、抖动、逐帧碰撞；PGZ 的 Actor 模型反而碍事 |
 | 窗口 | 960×540，固定，目标 60 FPS | 64px 瓦片 → 15×8.4 格视野；角色图片约 96px 高，碰撞盒独立配置 |
-| 本机验证 | 原设计记录为本机已安装 pygame 2.6.1；开始开发时仍需重新运行环境检查 | 不把历史环境状态当作当前保证 |
+| 本机验证 | **已实测**：海龟编辑器 `D:\tools\Pyblock`，内置 **Python 3.6.5 + pygame 1.9.6**，无头与真实窗口（windib）均运行通过 | 2026-11-23 实机核对，不再引用旧记录 |
 
-> ⚠️ 海龟编辑器里第一次运行前，需要「库管理 → 游戏 → 安装 Pygame」，否则 `import pygame` 会报错。
+> ⚠️ 海龟编辑器的 Pygame 是**内置的 1.9.6**，不需要也不应该去「库管理」再装一遍（装新版会和内置解释器冲突）。直接打开 `main.py` 按运行即可。
+
+> ⚠️ **pygame 1.9.6 API 边界**（实测，2026-11-23）：没有 `draw.rect(border_radius=)`、没有 `Rect.clipline()`、没有 `pygame.SCALED`、没有 `math.dist`。圆角面板、线段裁剪、距离计算统一走 `compat.py`，业务代码里禁止直接调用这些新 API。另：无头模式下 `set_mode` 默认返回 **8 位调色板表面**（文字变实心块、透明贴图贴不上），必须显式传 `depth=32`，`compat.make_display()` 已封装。
 
 ---
 
@@ -400,6 +402,7 @@
 火柴人跑酷/
 ├── main.py            入口：初始化、主循环、场景切换
 ├── config.py          所有常量与手感参数（唯一调参入口）
+├── compat.py          pygame 1.9.6 兼容层（圆角矩形/裁剪/染色/创建窗口）
 ├── assets.py          资源加载与缓存（图片预缩放、染色、字体、音效）
 ├── sketch.py          手绘风格绘制工具（抖动矩形/圆/线、粒子）
 ├── player.py          玩家状态机 + 物理
@@ -511,7 +514,8 @@ IDLE ──按方向──→ RUN ──离地──→ JUMP ──vy>0──→
 
 | 风险 | 概率 | 备选 |
 |---|---|---|
-| 海龟编辑器 pygame 版本旧，某些 API 不支持 | 中 | 只用 `pygame 2.0` 基础 API：`Surface.blit`、`draw.rect`、`mixer.Sound`；不用 `SCALED`、`geometry`、`Vector2.rotate` |
+| **（已发生，已处置）** 海龟编辑器 pygame 只有 1.9.6 | 高 | 已实测确认：`border_radius` / `Rect.clipline` / `SCALED` / `math.dist` 全部缺失。统一走 `compat.py`：`rounded_rect()`、`panel()`、`clip_line()`、`dist()`、`tint()`、`make_display()` |
+| **（已发生，已处置）** 无头模式显示面 8 位 | 高 | `set_mode` 显式 `depth=32`；游戏内也要用 `compat.make_display()`，不要直接调 `pygame.display.set_mode` |
 | 中文字体找不到（`simkai.ttf`） | 低 | 依次尝试 `simkai.ttf → msyh.ttc → 自带字体 → 英文 UI`；字体路径集中在 `config.py` |
 | OGG 无法播放 | 低 | 提供 `tools/ogg2wav.py` 一键转换，`assets.py` 优先找 `.ogg` 再找 `.wav` |
 | 60 帧掉帧 | 中 | 只渲染视口内瓦片；图片加载时预缩放并缓存；粒子池上限 80 |
@@ -1034,18 +1038,18 @@ README 是否需要更新：
 - [x] 已补充 AI 接手与交付协议。
 - [x] 用户已确认第 23 章全部 8 项玩法决策（详见第 23 章）。
 - [x] 按《素材清单》整理实际素材目录（`assets/` 共 124 个文件，883 KB）。
-- [x] 创建 `main.py` / `config.py` / `requirements.txt` / `.gitignore`，完成 M0 运行测试。
-- [ ] 在实际使用海龟编辑器的机器上安装 Pygame 并复跑一次（本地已验证 pygame 2.6.1）。
+- [x] 创建 `main.py` / `config.py` / `compat.py` / `requirements.txt` / `.gitignore`，完成 M0 运行测试。
+- [x] **在真正使用海龟编辑器的机器上实测通过**：编辑器路径 `D:\tools\Pyblock`，内置 Python 3.6.5 + pygame 1.9.6，无头（32 位）与真实窗口（windib）均运行成功，24 个 .ogg 音效可加载。
 
 ### 推荐下一步
 
 **M0 已完成，进入 M1：最小游戏骨架。**
 
-M0 实际交付：`assets/` 按《素材清单》整理完毕（124 个文件，883 KB，含 21 张主角帧与 11 张敌人图）；`config.py` 提供路径、配色与手感常量；`main.py` 打开 960×540 窗口、输出 pygame 版本与根目录、启动自检并渲染一帧验证画面；无头与真实显示驱动均运行通过，截图见 `docs/m0_check.png`。
+M0 实际交付：`assets/` 按《素材清单》整理完毕（124 个文件，883 KB，含 21 张主角帧与 11 张敌人图）；`config.py` 提供路径、配色与手感常量；`main.py` 打开 960×540 窗口、输出 pygame 版本与根目录、启动自检并渲染一帧验证画面；`compat.py` 封装 pygame 1.9.6 的 API 缺口；截图见 `docs/m0_check.png`。
 
 M1 只做骨架：拆出 `scenes.py` 的 Menu / Game 空场景与场景切换，保持"不依赖任何外部图片或音频也能跑"，验收通过后再进入 M2 的玩家物理。
 
-> 尚未完成：在真正使用海龟编辑器的机器上安装 Pygame 并复跑。本地验证版本为 pygame 2.6.1 / Python 3.13.14。
+> 目标环境已确认：**Python 3.6.5 + pygame 1.9.6**（海龟编辑器内置）。此后所有代码都必须在这个版本上跑通，不能用 3.7+ 语法（如 `dataclasses`）或 pygame 2.x API。
 
 ---
 
@@ -1111,7 +1115,8 @@ M1 只做骨架：拆出 `scenes.py` 的 Menu / Game 空场景与场景切换，
 | 2026-11-23 | 用户确认全部 8 项玩法决策；关卡分类不限定三关；新增独立《素材清单》交付要求；依据 source.zip 编制素材用途表 |
 | 2026-11-23 | 新增 GitHub 工作流：远程仓库 ink-015/Pyrun；每完成一个可验收的小任务即提交并推送，补充首次连接、日常提交、检查与 AI 交接规则 |
 | 2026-11-23 | 根据用户补充的 `火柴人.zip` 修正主角/敌人素材；统一地图出生点 `P`、敌人踩踏规则、死亡计时、素材目录、地砖用途、功能色和 UI 面板规范 |
-| 2026-11-23 | **M0 完成**：素材整理入 `assets/`；新增 `config.py`、`main.py`、`requirements.txt`、`.gitignore`；实测 `tile_*` 无法平铺为连续地面并记入 §3.1；本地 pygame 2.6.1 运行通过，截图 `docs/m0_check.png` |
+| 2026-11-23 | **M0 完成**：素材整理入 `assets/`；新增 `config.py`、`main.py`、`requirements.txt`、`.gitignore`；实测 `tile_*` 无法平铺为连续地面并记入 §3.1；截图 `docs/m0_check.png` |
+| 2026-11-23 | **海龟编辑器实机验证**：确认内置 Python 3.6.5 + pygame 1.9.6（`D:\tools\Pyblock`）；发现无头模式 8 位表面与 `border_radius`/`clipline`/`SCALED`/`math.dist` 缺失，新增 `compat.py` 统一兜底；重跑自检与截图通过，24 个 .ogg 可加载 |
 
 
 ---

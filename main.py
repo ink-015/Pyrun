@@ -16,6 +16,7 @@ import sys
 
 import pygame
 
+import compat
 import config
 
 
@@ -97,13 +98,13 @@ def draw_static_frame(screen, font_big, font_small, font_name):
     # 金币（烫金）
     coin = pygame.image.load(os.path.join(config.IMAGE_DIR, "collectibles", "tile_coin.png")).convert_alpha()
     coin = pygame.transform.smoothscale(coin, (44, 44))
-    coin.fill(config.COLOR_COIN, special_flags=pygame.BLEND_MULT)
+    coin = compat.tint(coin, config.COLOR_COIN)
     screen.blit(coin, (420, ground_y - 120))
 
     # 篝火（存档点，点亮态 = 橙）
     camp = pygame.image.load(os.path.join(config.IMAGE_DIR, "checkpoints", "campfire.png")).convert_alpha()
     camp = pygame.transform.smoothscale(camp, (72, 72))
-    camp.fill(config.COLOR_CAMP, special_flags=pygame.BLEND_MULT)
+    camp = compat.tint(camp, config.COLOR_CAMP)
     cb = camp.get_bounding_rect()
     screen.blit(camp, (540 - cb.x, ground_y - cb.bottom - 2))
 
@@ -120,10 +121,13 @@ def draw_static_frame(screen, font_big, font_small, font_name):
 def main():
     pygame.init()
     pygame.display.set_caption(config.TITLE)
-    screen = pygame.display.set_mode((config.WIDTH, config.HEIGHT))
+    screen = compat.make_display((config.WIDTH, config.HEIGHT))
     clock = pygame.time.Clock()
 
     report_environment()
+    print(" 显示   : %dx%d / %d 位 / 驱动 %s"
+          % (screen.get_width(), screen.get_height(), screen.get_bitsize(),
+             pygame.display.get_driver()))
 
     font_big, font_name = load_font(34, bold=True)
     font_small, _ = load_font(18)

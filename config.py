@@ -24,6 +24,11 @@ FPS = 60
 TILE = 64
 FIXED_DT = 1.0 / 60.0
 
+# 目标运行环境：海龟编辑器内置 Python 3.6.5 + pygame 1.9.6。
+# pygame 1.9.6 在无头（SDL_VIDEODRIVER=dummy）下默认给出 8 位调色板表面，
+# 会让文字变实心块、透明贴图贴不上，所以必须显式要求 32 位。
+DISPLAY_DEPTH = 32
+
 # ---------- 配色（README §2 功能色） ----------
 COLOR_PAPER = (250, 247, 238)      # 纸底 #FAF7EE
 COLOR_PAPER_LINE = (235, 231, 220)  # 极淡方格

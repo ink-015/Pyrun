@@ -1,1 +1,8 @@
-pygame>=2.0.0
+# 目标运行环境：海龟编辑器（Pyblock / TurtleEditor）内置解释器
+#   实测路径：D:\tools\Pyblock\resources\app\Python-win64\python.exe
+#   实测版本：Python 3.6.5 + pygame 1.9.6
+#
+# 不要用 pip 覆盖编辑器内置的 pygame，否则可能与它的解释器不匹配。
+# 若必须在普通 Python 里调试，pygame 1.9.6 及以上均可，但代码只能用
+# pygame 1.9.6 支持的 API（见 compat.py）。
+pygame>=1.9.6
