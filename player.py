@@ -36,10 +36,12 @@ class InputState(object):
         self.jump_held = False   # 当前是否按住
         self.jump_pressed = False
         self.jump_released = False
+        self.dash_pressed = False
 
     def release_edges(self):
         self.jump_pressed = False
         self.jump_released = False
+        self.dash_pressed = False
 
 
 class Player(object):
@@ -63,6 +65,12 @@ class Player(object):
         self.facing = 1
         self.land_timer = 0.0
         self.jump_count = 0
+
+        # ---- 冲刺（README §5，原排 M5，按需求提前到 M2.6）----
+        self.dash_time = 0.0      # 剩余冲刺时间，>0 表示正在冲刺
+        self.dash_cd = 0.0        # 冷却剩余
+        self.dash_dir = 1
+        self.dash_count = 0
 
         # ---- 动画状态（纯逻辑，不持有任何 Surface）----
         self.anim_state = "idle"    # idle / run / jump
@@ -98,8 +106,23 @@ class Player(object):
             self.jump_buffer = config.JUMP_BUFFER_TIME
             inp.jump_pressed = False
 
-        # 4. 水平加速 / 减速
-        if inp.axis != 0.0:
+        # 4. 冲刺：冷却计时 + 触发。
+        #    边沿在这里就消费掉，保证一帧（含多步 update）只可能冲一次。
+        self.dash_cd = max(0.0, self.dash_cd - dt)
+        if inp.dash_pressed:
+            inp.dash_pressed = False
+            if self.dash_cd <= 0.0 and self.dash_time <= 0.0:
+                self._start_dash(inp.axis)
+        dashing = self.dash_time > 0.0
+
+        # 5. 水平速度：冲刺期间接管，否则正常加速 / 减速
+        if dashing:
+            self.dash_time = max(0.0, self.dash_time - dt)
+            self.vx = self.dash_dir * config.DASH_SPEED
+            # 冻结竖直速度：地面冲刺贴地直冲，空中冲刺走直线不会往下沉
+            self.vy = 0.0
+            self.jumping = False
+        elif inp.axis != 0.0:
             self.facing = 1 if inp.axis > 0 else -1
             accel = config.GROUND_ACCEL if self.on_ground else config.AIR_ACCEL
             self.vx = _approach(self.vx, inp.axis * config.RUN_SPEED, accel * dt)
@@ -107,11 +130,17 @@ class Player(object):
             decel = config.GROUND_DECEL if self.on_ground else config.AIR_ACCEL * 0.6
             self.vx = _approach(self.vx, 0.0, decel * dt)
 
-        # 5. 水平移动与碰撞
+        # 6. 水平移动与碰撞
         self._move_horizontal(self.vx * dt, solids)
 
-        # 6. 起跳：有缓冲，且（在地面 或 还在土狼窗口内）
-        if self.jump_buffer > 0.0 and (self.on_ground or self.coyote > 0.0):
+        # 撞墙立刻收招，否则会贴着墙把剩余冲刺时间白白耗完
+        if dashing and self.vx == 0.0:
+            self.dash_time = 0.0
+            dashing = False
+
+        # 7. 起跳：有缓冲，且（在地面 或 还在土狼窗口内）。冲刺中不接受起跳
+        if (not dashing) and self.jump_buffer > 0.0 \
+                and (self.on_ground or self.coyote > 0.0):
             self.vy = config.JUMP_SPEED
             self.on_ground = False
             self.coyote = 0.0      # 起跳后清零，否则 0.1s 内会变成二段跳
@@ -119,26 +148,28 @@ class Player(object):
             self.jumping = True    # 标记"处于可被切短的上升段"
             self.jump_count += 1
 
-        # 7. 松开切跳：只在上升段、且只切一次
+        # 8. 松开切跳：只在上升段、且只切一次
         if inp.jump_released:
             inp.jump_released = False
             if self.vy < 0.0 and self.jumping:
                 self.vy *= config.JUMP_CUT
                 self.jumping = False
 
-        # 8. 重力：上升用 GRAVITY_UP，按住时再乘 0.85，滞空更久
-        if self.vy < 0.0:
-            g = config.GRAVITY_UP
-            if inp.jump_held and self.jumping:
-                g *= config.JUMP_HOLD_GRAVITY_SCALE
-        else:
-            g = config.GRAVITY_DOWN
-        self.vy = min(self.vy + g * dt, config.MAX_FALL_SPEED)
+        # 9. 重力：上升用 GRAVITY_UP，按住时再乘 0.85，滞空更久。
+        #    冲刺期间跳过——否则 vy 每帧又被拉回正值，冻结就没意义了。
+        if not dashing:
+            if self.vy < 0.0:
+                g = config.GRAVITY_UP
+                if inp.jump_held and self.jumping:
+                    g *= config.JUMP_HOLD_GRAVITY_SCALE
+            else:
+                g = config.GRAVITY_DOWN
+            self.vy = min(self.vy + g * dt, config.MAX_FALL_SPEED)
 
-        # 9. 垂直移动与碰撞
+        # 10. 垂直移动与碰撞
         self._move_vertical(self.vy * dt, solids)
 
-        # 10. 脚下贴合。
+        # 11. 脚下贴合。
         #     静止站立时 vy 很小，位移不足 1 像素，矩形根本没动，
         #     光靠 colliderect 会漏判 → on_ground 每帧 True/False 闪烁，
         #     表现为站在边缘"抖"。这里用 2px 向下探测把状态钉死。
@@ -157,8 +188,28 @@ class Player(object):
         if self.land_timer > 0.0:
             self.land_timer = max(0.0, self.land_timer - dt)
 
-        # 11. 动画状态：只算「处于什么动作」和「第几帧」，不碰任何贴图
+        # 12. 动画状态：只算「处于什么动作」和「第几帧」，不碰任何贴图
         self._update_anim(dt)
+
+    # ---------------------------------------------------------------- 冲刺
+    def _start_dash(self, axis):
+        """起手冲刺。方向优先取当前输入，没有输入就沿用朝向。"""
+        d = 1 if axis > 0 else (-1 if axis < 0 else self.facing)
+        self.dash_dir = d
+        self.facing = d
+        self.dash_time = config.DASH_TIME
+        # 冷却从起手就开始算，不是冲刺结束才算——否则连按会越冲越密
+        self.dash_cd = config.DASH_COOLDOWN
+        self.dash_count += 1
+        self.vy = 0.0
+        self.jumping = False
+
+    @property
+    def dashing(self):
+        return self.dash_time > 0.0
+
+    def can_dash(self):
+        return self.dash_cd <= 0.0 and self.dash_time <= 0.0
 
     # ---------------------------------------------------------------- 动画
     def _update_anim(self, dt):
@@ -171,7 +222,11 @@ class Player(object):
           - 速度越快步频越快，看着不会"滑步"
           - 减速时脚步自然变慢，而不是保持匀速迈腿
         """
-        if not self.on_ground:
+        if self.dashing:
+            # 冲刺用跑步帧快速播放：素材里没有专门的冲刺姿态，
+            # 让腿"转得比平时快"比换成跳跃的举手姿势更像一回事
+            state = "run"
+        elif not self.on_ground:
             state = "jump"
         elif abs(self.vx) > config.RUN_ANIM_MIN_SPEED:
             state = "run"
@@ -179,7 +234,7 @@ class Player(object):
             state = "idle"
 
         if state != self.anim_state:
-            if state == "run":
+            if state == "run" and not self.dashing:
                 self.anim_phase = 0.0   # 重新起跑从第一帧开始，不接着上次相位
             self.anim_state = state
 
@@ -263,6 +318,15 @@ class Player(object):
             "state %s  coyote %.3f  buf %.3f"
             % ("GROUND" if self.on_ground else "AIR", self.coyote, self.jump_buffer),
             "jumps %d  facing %+d" % (self.jump_count, self.facing),
+            "dash  %s  cd %.2f  n=%d"
+            % ("ON" if self.dashing else "  ", self.dash_cd, self.dash_count),
             "anim %s #%d  phase %.2f"
             % (self.anim_state, self.anim_frame, self.anim_phase),
         ]
+
+    @property
+    def dash_ready_ratio(self):
+        """冷却进度 0..1（1 表示可用），HUD 画冷却弧用。"""
+        if config.DASH_COOLDOWN <= 0.0:
+            return 1.0
+        return max(0.0, min(1.0, 1.0 - self.dash_cd / config.DASH_COOLDOWN))

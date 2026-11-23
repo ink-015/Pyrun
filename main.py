@@ -12,6 +12,7 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py                 正常启动，进主菜单
     python main.py --smoke         渲染一帧菜单并截图，用于环境验证
     python main.py --smoke-game    跳到第一关跑几步并截图
+    python main.py --smoke-dash    抓一张冲刺中的画面（看残影与冷却条）
     python main.py --smoke-goal    跑到终点，截下结算面板
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -302,6 +303,27 @@ def main():
         app.scenes.draw(screen)
         pygame.display.flip()
         print(" 截图   :", save_screenshot(screen, "m1_menu.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-dash" in sys.argv:
+        # 冲刺过程截图：跑到有速度，然后起手冲刺，抓冲刺中的一帧
+        app.scenes.start("game")
+        scene = app.scenes.current
+        for _ in range(20):
+            app.scenes.update(config.FIXED_DT)
+        scene.override_axis = 1.0
+        for _ in range(40):
+            app.scenes.update(config.FIXED_DT)
+        scene.input.dash_pressed = True
+        for _ in range(3):
+            app.scenes.update(config.FIXED_DT)
+        p = scene.player
+        print(u" 冲刺中   : dashing=%s  vx=%.1f  dash_time=%.3f"
+              % (p.dashing, p.vx, p.dash_time))
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(" 截图   :", save_screenshot(screen, "m26_dash.png"))
         pygame.quit()
         return 0
 

@@ -40,6 +40,8 @@ COLOR_CAMP = (242, 164, 75)        # 篝火 #F2A44B
 COLOR_GROUND = (251, 250, 246)     # 地面 #FBFAF6
 COLOR_HILL = (206, 203, 194)       # 远山 #CECBC2
 COLOR_WATER = (198, 222, 232)
+COLOR_DASH = (110, 158, 210)       # 冲刺冷却条（功能色，不参与美术）
+COLOR_TRAIL = (186, 182, 172)      # 冲刺残影线，比墨线淡，不抢主体
 
 # ---------- 手感参数（README §5，M2 起使用） ----------
 GRAVITY_UP = 1900.0

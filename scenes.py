@@ -388,7 +388,8 @@ class GameScene(Scene):
         每帧画两个就是 1.5ms——比整个地形渲染还贵。所以固化到一张图上。
         """
         surf = pygame.Surface((config.WIDTH, config.HEIGHT), pygame.SRCALPHA)
-        left = pygame.Rect(16, 14, 240, 62)
+        # 左面板留出三行：关卡名 / 金币 / 冲刺冷却条，所以比 M3 高一些
+        left = pygame.Rect(16, 14, 240, 86)
         compat.panel(surf, left, radius=14, fill=(255, 255, 255),
                      border=config.COLOR_INK, width=2)
         right = pygame.Rect(config.WIDTH - 156, 14, 140, 42)
@@ -408,6 +409,8 @@ class GameScene(Scene):
             if event.key == pygame.K_SPACE:
                 self.input.jump_pressed = True
                 self.input.jump_held = True
+            elif event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
+                self.input.dash_pressed = True
             elif event.key == pygame.K_F1:
                 self.show_debug = not self.show_debug
             elif event.key == pygame.K_r:
@@ -495,7 +498,8 @@ class GameScene(Scene):
             self._draw_debug(surface)
 
         f_hint, _ = get_font(16)
-        hint = u"← → / A D 移动     空格 跳跃     R 重开     F1 调试     Esc 返回菜单"
+        hint = (u"← → / A D 移动     空格 跳跃     Shift 冲刺     "
+                u"R 重开     F1 调试     Esc 返回菜单")
         w = f_hint.size(hint)[0]
         surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
                      ((config.WIDTH - w) // 2, config.HEIGHT - 26))
@@ -514,6 +518,7 @@ class GameScene(Scene):
         """
         p = self.player
         ox, oy = self.camera.offset
+        self._draw_dash_trail(surface, ox, oy)
         if self.sprites is None:
             draw_stick_figure(surface, p.rect.centerx + ox, p.rect.bottom + oy)
             return
@@ -525,6 +530,29 @@ class GameScene(Scene):
                                      p.rect.bottom + int(round(p.land_sink)),
                                      p.anim_state, p.facing, idx)
         surface.blit(img, (x + ox, y + oy))
+
+    def _draw_dash_trail(self, surface, ox, oy):
+        """冲刺残影：身后拖三条墨线。
+
+        素材里没有冲刺姿态，也没有做多帧残影的预算（每次 alpha 混合都要
+        多一次 blit）。三条长度随剩余冲刺时间收短的线就够看清"我在冲"。
+        """
+        p = self.player
+        if not p.dashing:
+            return
+        ratio = p.dash_time / max(1e-6, config.DASH_TIME)
+        base = 24.0 + 40.0 * ratio
+        y0 = p.rect.centery + oy
+        for i, dy in enumerate((-16, 0, 16)):
+            length = base - i * 7.0
+            if p.dash_dir > 0:
+                x1 = p.rect.left + ox - 3
+                x2 = int(x1 - length)
+            else:
+                x1 = p.rect.right + ox + 3
+                x2 = int(x1 + length)
+            pygame.draw.line(surface, config.COLOR_TRAIL,
+                             (x1, y0 + dy), (x2, y0 + dy), 2)
 
     def _level_title(self):
         name = self.world.name if self.world else ""
@@ -544,6 +572,29 @@ class GameScene(Scene):
         tw = f_small.size(t)[0]
         surface.blit(f_small.render(t, True, config.COLOR_INK),
                      (config.WIDTH - 30 - tw, 27))
+
+        self._draw_dash_meter(surface)
+
+    def _draw_dash_meter(self, surface):
+        """HUD 第三行：冲刺冷却条。
+
+        没有反馈的话，冷却中按 Shift 会让人以为按键坏了。放在面板里而不是
+        屏幕右下角，是因为那里离底部操作提示太近，两者会挤在一起。
+        """
+        p = self.player
+        f, _ = get_font(14)
+        surface.blit(f.render(u"冲刺", True, config.COLOR_MUTED), (30, 66))
+
+        bar = pygame.Rect(72, 69, 140, 9)
+        pygame.draw.rect(surface, (255, 255, 255), bar)
+        ratio = p.dash_ready_ratio
+        fill = int((bar.width - 2) * ratio)
+        if fill > 0:
+            color = config.COLOR_DASH if ratio >= 1.0 else (206, 210, 216)
+            pygame.draw.rect(surface, color,
+                             pygame.Rect(bar.left + 1, bar.top + 1,
+                                         fill, bar.height - 2))
+        pygame.draw.rect(surface, config.COLOR_INK, bar, 1)
 
     def _draw_goal_panel(self, surface):
         box = pygame.Rect(0, 0, 420, 190)
@@ -594,7 +645,7 @@ class GameScene(Scene):
         cam = self.camera
         lines.append("cam  %.1f, %.1f  off %s"
                      % (cam.x, cam.y, cam.offset))
-        box = pygame.Rect(16, 88, 380, 16 + 20 * len(lines))
+        box = pygame.Rect(16, 112, 380, 16 + 20 * len(lines))
         pygame.draw.rect(surface, (255, 255, 255), box)
         pygame.draw.rect(surface, config.COLOR_INK, box, 2)
         for i, line in enumerate(lines):

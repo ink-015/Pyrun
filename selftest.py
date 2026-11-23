@@ -514,6 +514,112 @@ def test_anim_state():
            u"state=%s" % p.anim_state)
 
 
+def test_dash():
+    _section(u"冲刺")
+
+    solids = _flat()
+    p = player.Player(200, 460 - player.Player.HEIGHT)
+    _land(p, solids, 4)
+
+    inp = player.InputState()
+    inp.axis = 1.0
+    inp.dash_pressed = True
+    x0 = p.x
+    p.update(DT, inp, solids)
+    _check(u"冲刺起手达到冲刺速", abs(p.vx - config.DASH_SPEED) < 1.0,
+           u"vx=%.1f（目标 %.0f）" % (p.vx, config.DASH_SPEED))
+    _check(u"冲刺中仍算在地面", p.on_ground, u"on_ground=%s" % p.on_ground)
+    _check(u"冷却从起手开始计", abs(p.dash_cd - config.DASH_COOLDOWN) < 1e-6,
+           u"cd=%.3f" % p.dash_cd)
+
+    # 冲完一整个 DASH_TIME，量总位移
+    frames = 1
+    while p.dashing and frames < 60:
+        p.update(DT, inp, solids)
+        frames += 1
+    travel = p.x - x0
+    want = config.DASH_SPEED * config.DASH_TIME
+    _check(u"冲刺距离符合设定", abs(travel - want) < 0.12 * want,
+           u"%.1f px（理论 %.1f，%d 帧）" % (travel, want, frames))
+
+    # 收招那一帧的速度还是冲刺速（本帧位移已经用掉了），下一帧才开始衰减。
+    # 8 帧内必须落回跑速，否则就是"冲刺结束后还在偷偷加速"。
+    decayed = None
+    for i in range(1, 9):
+        p.update(DT, inp, solids)
+        if p.vx <= config.RUN_SPEED + 1.0:
+            decayed = i
+            break
+    _check(u"冲刺后回落到跑速", decayed is not None,
+           u"%d 帧后 vx=%.1f" % (decayed or -1, p.vx))
+
+    # 冷却期内再按无效
+    before = p.dash_count
+    inp.dash_pressed = True
+    p.update(DT, inp, solids)
+    _check(u"冷却中不能连按", p.dash_count == before,
+           u"次数仍为 %d，cd=%.2f" % (p.dash_count, p.dash_cd))
+
+    # 冷却结束后恢复
+    idle = _idle()
+    idle.axis = 1.0
+    for _ in range(int(config.DASH_COOLDOWN / DT) + 3):
+        p.update(DT, idle, solids)
+    _check(u"冷却结束恢复可用", p.can_dash(), u"cd=%.3f" % p.dash_cd)
+    idle.dash_pressed = True
+    p.update(DT, idle, solids)
+    _check(u"可以再次冲刺", p.dash_count == before + 1,
+           u"次数 %d" % p.dash_count)
+
+    # ---- 空中冲刺：竖直速度被冻结，走直线不往下沉 ----
+    p2 = player.Player(200, 460 - player.Player.HEIGHT)
+    _land(p2, solids, 4)
+    jump = _idle()
+    jump.jump_pressed = True
+    jump.jump_held = True
+    p2.update(DT, jump, solids)
+    for _ in range(4):
+        p2.update(DT, jump, solids)
+    vy_before = p2.vy
+    air = _idle()
+    air.axis = 1.0
+    air.dash_pressed = True
+    y0 = p2.y
+    p2.update(DT, air, solids)
+    _check(u"空中冲刺前正在上升", vy_before < 0, u"vy=%.1f" % vy_before)
+    _check(u"空中冲刺冻结下落", p2.vy == 0.0, u"vy=%.1f" % p2.vy)
+    _check(u"空中冲刺走直线", abs(p2.y - y0) < 0.01, u"dy=%.2f" % (p2.y - y0))
+    for _ in range(12):
+        p2.update(DT, air, solids)
+    _check(u"冲完恢复重力", p2.vy > 0.0, u"vy=%.1f" % p2.vy)
+
+    # ---- 撞墙立刻收招 ----
+    wall = [pygame.Rect(0, 460, config.WIDTH, 80), pygame.Rect(200, 300, 40, 160)]
+    p3 = player.Player(100, 460 - player.Player.HEIGHT)
+    _land(p3, wall, 4)
+    into = _idle()
+    into.axis = 1.0
+    into.dash_pressed = True
+    p3.update(DT, into, wall)          # 先起手，否则循环条件一开始就为假
+    hits = 1
+    while p3.dash_time > 0.0 and hits < 20:
+        p3.update(DT, into, wall)
+        hits += 1
+    _check(u"冲刺中撞墙立刻收招", p3.dash_time == 0.0 and hits < 10,
+           u"%d 帧后撞上，dash_time=%.3f" % (hits, p3.dash_time))
+    _check(u"撞墙后不嵌进墙里", p3.rect.right <= 201, u"right=%d" % p3.rect.right)
+
+    # ---- 无方向输入时按朝向冲 ----
+    p4 = player.Player(300, 460 - player.Player.HEIGHT)
+    _land(p4, solids, 4)
+    p4.facing = -1
+    none_dir = _idle()
+    none_dir.dash_pressed = True
+    p4.update(DT, none_dir, solids)
+    _check(u"无输入时按朝向冲", p4.dash_dir == -1, u"dir=%+d" % p4.dash_dir)
+    _check(u"冲刺中不接受起跳", p4.jump_count == 0, u"jumps=%d" % p4.jump_count)
+
+
 def test_land_feel():
     _section(u"落地反馈")
 
@@ -772,6 +878,7 @@ def run(app):
     test_sprites()
     test_anim_state()
     test_land_feel()
+    test_dash()
     test_physics()
     test_level_parse()
     test_level_errors()
