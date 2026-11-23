@@ -386,6 +386,280 @@ def test_jump_20():
            detail or u"jumps=%d" % p.jump_count)
 
 
+# ---------------------------------------------------------------- M4 机关
+L2 = os.path.join(config.LEVEL_DIR, "l2.txt")
+
+
+def _run(scene, frames):
+    for _ in range(frames):
+        scene.update(DT)
+
+
+def test_oneway():
+    _section(u"M4 单向平台")
+
+    solids = _flat()                      # 地面顶面 y=460
+    oneway = [pygame.Rect(200, 380, 140, config.ONEWAY_THICK)]
+    p = player.Player(240, 460 - player.Player.HEIGHT)
+    _land(p, solids, 4)
+
+    inp = player.InputState()
+    inp.jump_pressed = True
+    inp.jump_held = True
+    min_bottom = 9999.0
+    frames = 0
+    while frames < 90:
+        p.update(DT, inp, solids, oneways=oneway)
+        frames += 1
+        min_bottom = min(min_bottom, p.rect.bottom)
+        if frames > 5 and p.on_ground:
+            break
+
+    _check(u"可以从下方穿过单向平台", min_bottom < oneway[0].top - 2,
+           u"最高脚底 %.1f / 平台顶 %d" % (min_bottom, oneway[0].top))
+    _check(u"落下后站在单向平台上",
+           p.on_ground and abs(p.rect.bottom - oneway[0].top) <= 1,
+           u"脚底 %.1f（平台顶 %d）" % (p.rect.bottom, oneway[0].top))
+
+    # 走出板子右缘应掉落，不是粘在边上
+    inp2 = player.InputState()
+    inp2.axis = 1.0
+    for _ in range(40):
+        p.update(DT, inp2, solids, oneways=oneway)
+    _check(u"走出板缘会掉下去", p.rect.bottom > oneway[0].top + 2,
+           u"脚底 %.1f" % p.rect.bottom)
+
+
+def test_bouncer():
+    _section(u"M4 弹跳板")
+
+    solids = _flat()
+    pad = pygame.Rect(200, 452, 56, 8)     # 顶面 452，比地面高 8px
+    p = player.Player(210, 200)
+    idle = player.InputState()
+
+    start = None
+    min_feet = 9999.0
+    for i in range(60):
+        p.update(DT, idle, solids, bouncers=[pad])
+        if p.bounce_count:
+            if start is None:
+                start = i
+            min_feet = min(min_feet, p.y + player.Player.HEIGHT)
+        if start is not None and i > start + 3 and p.on_ground:
+            break
+
+    _check(u"踩到弹跳板会被弹起", p.bounce_count == 1,
+           u"触发 %d 次" % p.bounce_count)
+    rise = (460.0 - min_feet) if start is not None else 0.0
+    jump_h = _jump_height(999)
+    _check(u"弹起高度大于普通跳跃", rise > jump_h + 40,
+           u"弹起 %.0fpx vs 跳高 %.0fpx" % (rise, jump_h))
+    _check(u"一次下落只触发一次", p.bounce_count == 1,
+           u"bounce_count=%d" % p.bounce_count)
+
+    # 弹起不是跳跃：jump_count 不该被算进去，空中按跳跃也不该变成二段跳
+    p3 = player.Player(210, 200)
+    for _ in range(40):
+        p3.update(DT, idle, solids, bouncers=[pad])
+        if p3.bounce_count:
+            break
+    _check(u"弹起不计入跳跃次数", p3.jump_count == 0,
+           u"jump=%d bounce=%d" % (p3.jump_count, p3.bounce_count))
+    air = player.InputState()
+    air.jump_pressed = True
+    air.jump_held = True
+    p3.update(DT, air, solids, bouncers=[pad])
+    _check(u"弹起后按跳跃不会二段跳", p3.jump_count == 0,
+           u"jump=%d vy=%.0f" % (p3.jump_count, p3.vy))
+
+
+def test_platform():
+    _section(u"M4 移动平台")
+
+    w = world.World.load(L2)
+    xs = [p for p in w.platforms if p.axis == "x"]
+    ys = [p for p in w.platforms if p.axis == "y"]
+    _check(u"l2 有一个水平平台与一个升降平台",
+           len(xs) == 1 and len(ys) == 1,
+           u"水平 %d / 垂直 %d" % (len(xs), len(ys)))
+
+    plat = xs[0]
+    start = plat.rect.x
+    seen = []
+    for _ in range(360):
+        plat.update(DT)
+        seen.append(plat.rect.x - start)
+    _check(u"行程恰好 2 格", abs(max(seen) - config.PLATFORM_TRAVEL) < 1.0,
+           u"最远 %.1f px（期望 %.0f）" % (max(seen), config.PLATFORM_TRAVEL))
+    _check(u"会往返回到起点", min(seen[100:]) <= 1.0,
+           u"第二轮最左 %.1f px，末帧 %.1f" % (min(seen[100:]), seen[-1]))
+    step = max(abs(seen[i + 1] - seen[i]) for i in range(len(seen) - 1))
+    _check(u"单帧位移不超过 3px", step <= 3.0,
+           u"最大 %.1f px/帧（%.0f px/s）" % (step, config.PLATFORM_SPEED))
+
+    plat2 = ys[0]
+    y0 = plat2.rect.y
+    for _ in range(60):
+        plat2.update(DT)
+    _check(u"升降平台向上走", plat2.rect.y < y0,
+           u"y %.0f -> %.0f" % (y0, plat2.rect.y))
+
+
+def test_m4_scene(app):
+    _section(u"M4 死亡 / 检查点 / 平台带动")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L2)
+    w = scene.world
+    if w is None:
+        _check(u"l2 可加载", False, scene.load_error)
+        return
+
+    _check(u"l2 尺寸 56x12", (w.width_tiles, w.height_tiles) == (56, 12),
+           u"%d x %d" % (w.width_tiles, w.height_tiles))
+    _check(u"篝火 2 个", len(w.checkpoints) == 2, u"%d 个" % len(w.checkpoints))
+    _check(u"弹跳板 1 个", len(w.bouncers) == 1, u"%d 个" % len(w.bouncers))
+    _check(u"危险格已解析", len(w.hazard_boxes) >= 5,
+           u"%d 个判定框" % len(w.hazard_boxes))
+
+    # 篝火脚下必须有地面，否则重生会直接掉进坑里
+    bad = [cp for cp in w.checkpoints
+           if not w.is_solid_px(cp["spawn"][0] + 5, cp["spawn"][1] + 72)]
+    _check(u"篝火都踩在实地上", not bad, u"%d 个悬空" % len(bad))
+
+    # ---- 平台带动 ----
+    plat = [p for p in w.platforms if p.axis == "x"][0]
+    scene.player.teleport(plat.rect.centerx - player.Player.WIDTH // 2,
+                          plat.rect.top - player.Player.HEIGHT)
+    _run(scene, 6)
+    _check(u"玩家站到了移动平台上", scene.player.on_ground,
+           u"on_ground=%s 脚底 %.1f" % (scene.player.on_ground,
+                                       scene.player.rect.bottom))
+    x0, px0 = scene.player.x, plat.rect.x
+    _run(scene, 36)
+    dx, dpx = scene.player.x - x0, plat.rect.x - px0
+    _check(u"平台把玩家一起带走", abs(dx - dpx) < 2.5,
+           u"玩家 %+.1f px，平台 %+.1f px" % (dx, dpx))
+    _check(u"全程贴在平台顶面",
+           abs(scene.player.rect.bottom - plat.rect.top) <= 2,
+           u"脚底 %.1f / 平台顶 %d" % (scene.player.rect.bottom, plat.rect.top))
+    _check(u"带人时没有被挤死", scene.deaths == 0, u"死亡 %d 次" % scene.deaths)
+
+    # ---- 死亡：掉进水里 ----
+    water = w.hazard_boxes[1][0]            # 第一个水格判定框
+    scene.player.teleport(water.centerx, water.top)
+    _run(scene, 1)
+    _check(u"碰到水会死", scene.deaths == 1, u"死亡 %d 次" % scene.deaths)
+    _check(u"死亡后进入定格", scene.death_timer > 0.0,
+           u"定格剩余 %.2fs" % scene.death_timer)
+
+    _run(scene, 4)
+    _check(u"定格期间不重复计数", scene.deaths == 1,
+           u"死亡 %d 次" % scene.deaths)
+
+    _run(scene, int(config.DEATH_FREEZE / DT) + 3)
+    _check(u"定格结束会重生", scene.respawn_count == 1,
+           u"重生 %d 次" % scene.respawn_count)
+    _check(u"没点篝火时回出生点",
+           abs(scene.player.x - w.spawn[0]) < 1.0
+           and abs(scene.player.y - w.spawn[1]) < 1.0,
+           u"位置 (%.0f, %.0f)，出生点 %s"
+           % (scene.player.x, scene.player.y, w.spawn))
+    _check(u"重生后有短暂无敌", scene.invuln > 0.0, u"invuln=%.2f" % scene.invuln)
+
+    # ---- 篝火 ----
+    cp = w.checkpoints[0]
+    scene.player.teleport(cp["spawn"][0], cp["spawn"][1])
+    _run(scene, 2)
+    _check(u"碰到篝火会点亮", cp["active"], u"active=%s" % cp["active"])
+    _check(u"重生点改为该篝火",
+           scene.checkpoint == cp["spawn"], u"cp=%s" % (scene.checkpoint,))
+
+    # 等无敌时间过去，再死一次，看是否回到篝火
+    _run(scene, int(config.INVULN_TIME / DT) + 4)
+    deaths_before = scene.deaths
+    scene.player.teleport(water.centerx, water.top)
+    _run(scene, 1)
+    _check(u"点亮后再死仍会计数", scene.deaths == deaths_before + 1,
+           u"死亡 %d -> %d" % (deaths_before, scene.deaths))
+    _run(scene, int(config.DEATH_FREEZE / DT) + 3)
+    _check(u"重生在最近点亮的篝火",
+           abs(scene.player.x - cp["spawn"][0]) < 1.0
+           and abs(scene.player.y - cp["spawn"][1]) < 1.0,
+           u"位置 (%.0f, %.0f)，篝火 %s"
+           % (scene.player.x, scene.player.y, cp["spawn"]))
+
+    # ---- T 回检查点不算死亡 ----
+    deaths_before = scene.deaths
+    scene.player.teleport(600, 500)
+    ok = scene.go_to_checkpoint()
+    _check(u"T 能回检查点", ok, u"返回 %s" % ok)
+    _check(u"T 不增加死亡数", scene.deaths == deaths_before,
+           u"死亡 %d -> %d" % (deaths_before, scene.deaths))
+    _check(u"T 后位置在篝火",
+           abs(scene.player.x - cp["spawn"][0]) < 1.0,
+           u"x=%.0f" % scene.player.x)
+
+    # ---- 重开本关 ----
+    scene.restart()
+    _check(u"R 重开清空死亡数", scene.deaths == 0 and scene.respawn_count == 0,
+           u"deaths=%d" % scene.deaths)
+    _check(u"R 重开熄灭篝火",
+           not any(c["active"] for c in scene.world.checkpoints),
+           u"点亮 %d 个" % len([c for c in scene.world.checkpoints if c["active"]]))
+    _check(u"R 重开回到出生点",
+           abs(scene.player.x - scene.world.spawn[0]) < 1.0,
+           u"x=%.0f" % scene.player.x)
+    _check(u"R 重开把平台复位",
+           scene.world.platforms[0].offset == 0.0
+           and scene.world.platforms[1].offset == 0.0,
+           u"offset=%.1f" % scene.world.platforms[0].offset)
+
+    # ---- 真的坐平台过一次 5 格坑：证明这段不是"看着能过"----
+    # 输入节奏取自 tools/try_l2_cross.py 的实测：助跑到岸边 → 跳 6 帧 →
+    # 落到平台上 → 松手让平台带 → 到远端走上岸。轻点跳（2~3 帧）够不到
+    # 平台左缘，这是关卡要求的操作精度，不是 bug。
+    scene.restart()
+    plat = [p for p in scene.world.platforms if p.axis == "x"][0]
+    p = scene.player
+    p.teleport(36 * config.TILE - player.Player.WIDTH,
+               10 * config.TILE - player.Player.HEIGHT)
+    _run(scene, 2)
+    for _ in range(600):
+        if plat.offset <= 1.0:          # 等平台回到近端再起跑
+            break
+        _run(scene, 1)
+    scene.override_axis = 1.0
+    frames = 0
+    while p.x < 36 * config.TILE + 56 and frames < 90:
+        _run(scene, 1)
+        frames += 1
+    scene.input.jump_pressed = True
+    scene.input.jump_held = True
+    _run(scene, 6)
+    scene.input.jump_held = False
+    scene.input.jump_released = True
+    for _ in range(60):
+        _run(scene, 1)
+        if p.on_ground:
+            break
+    on_board = p.on_ground and abs(p.rect.bottom - plat.rect.top) <= 2
+    for _ in range(600):
+        if plat.offset >= config.PLATFORM_TRAVEL - 1.0:
+            break
+        _run(scene, 1)
+    _run(scene, 80)
+    scene.override_axis = None
+    _check(u"l2 的 5 格坑能坐平台过去",
+           on_board and p.x > 42 * config.TILE and p.on_ground,
+           u"上板=%s 最终 x=%.0f（对岸 %d）脚底 %.0f"
+           % (on_board, p.x, 42 * config.TILE, p.rect.bottom))
+    _check(u"过坑全程没死", scene.deaths == 0, u"死亡 %d 次" % scene.deaths)
+
+
+
 def test_physics():
     test_move()
     test_jump_basic()
@@ -880,6 +1154,10 @@ def run(app):
     test_land_feel()
     test_dash()
     test_physics()
+    test_oneway()
+    test_bouncer()
+    test_platform()
+    test_m4_scene(app)
     test_level_parse()
     test_level_errors()
     test_camera()

@@ -14,6 +14,9 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-game    跳到第一关跑几步并截图
     python main.py --smoke-dash    抓一张冲刺中的画面（看残影与冷却条）
     python main.py --smoke-goal    跑到终点，截下结算面板
+    python main.py --smoke-m4      在机关关 l2 截一张（篝火/地刺/单向平台/移动平台）
+    python main.py --smoke-death   触发一次落水死亡，截下死亡定格画面
+    python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
     python main.py --smoke-run     连续截取跑动帧拼成一条，判断动作连贯性
@@ -265,6 +268,21 @@ def run_bench(app, frames):
 
 # ---------------------------------------------------------------- 主流程
 
+def _pick_level(argv):
+    """解析 --level：可以给 l2、l2.txt 或完整路径，缺省用第一关。"""
+    if "--level" not in argv:
+        return config.DEFAULT_LEVEL
+    i = argv.index("--level")
+    if i + 1 >= len(argv):
+        return config.DEFAULT_LEVEL
+    name = argv[i + 1]
+    if os.path.isabs(name) or os.sep in name:
+        return name
+    if not name.endswith(".txt"):
+        name += ".txt"
+    return os.path.join(config.LEVEL_DIR, name)
+
+
 def main():
     pygame.init()
     pygame.display.set_caption(config.TITLE)
@@ -287,6 +305,9 @@ def main():
     app.scenes.register("menu", scenes.MenuScene)
     app.scenes.register("game", scenes.GameScene)
     app.scenes.start("menu")
+
+    # --level 先落到 app 上，游戏场景构造时会读它；不写就还是第一关
+    app.level_path = _pick_level(sys.argv)
 
     # ---- 一次性渲染并截图的调试分支 ----
     if "--smoke-assets" in sys.argv:
@@ -363,6 +384,43 @@ def main():
               % (scene.goal_reached, scene.level_time,
                  w.taken_coins, w.total_coins))
         print(" 截图   :", save_screenshot(screen, "m3_goal.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-m4" in sys.argv:
+        # 机关关：直接把玩家放到移动平台上，让一屏里同时出现
+        # 水坑 + 平台 + 篝火 + 升降台 + 藏币台，用来核对机关画得对不对
+        app.level_path = os.path.join(config.LEVEL_DIR, "l2.txt")
+        app.scenes.start("game")
+        scene = app.scenes.current
+        plat = [p for p in scene.world.platforms if p.axis == "x"][0]
+        scene.player.teleport(plat.rect.centerx - player.Player.WIDTH // 2,
+                              plat.rect.top - player.Player.HEIGHT)
+        for _ in range(40):
+            app.scenes.update(config.FIXED_DT)
+        print(u" 平台     : %s  offset=%.0f" % (plat.rect, plat.offset))
+        print(u" 玩家     : x=%.0f 脚底=%.0f（平台顶 %d）"
+              % (scene.player.x, scene.player.rect.bottom, plat.rect.top))
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(" 截图   :", save_screenshot(screen, "m4_level2.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-death" in sys.argv:
+        # 死亡定格画面。用第一次水坑，最直观
+        app.level_path = os.path.join(config.LEVEL_DIR, "l2.txt")
+        app.scenes.start("game")
+        scene = app.scenes.current
+        water = scene.world.hazard_boxes[1][0]
+        scene.player.teleport(water.centerx, water.top)
+        for _ in range(2):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 死亡     : %d 次，原因「%s」，定格 %.2fs"
+              % (scene.deaths, scene.last_death_cause, scene.death_timer))
+        print(" 截图   :", save_screenshot(screen, "m4_death.png"))
         pygame.quit()
         return 0
 

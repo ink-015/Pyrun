@@ -301,10 +301,10 @@ class MenuScene(Scene):
 # ---------------------------------------------------------------- 游戏场景
 
 class GameScene(Scene):
-    """M3：关卡文件 + 相机跟随 + 基础 HUD。
+    """M4：关卡文件 + 相机跟随 + HUD + 死亡流程 + 篝火 + 机关。
 
-    地形、出生点、终点、金币全部来自 levels/*.txt，代码里不再硬编码任何
-    关卡数据。这样可以只改文本就调整关卡，也为 M6 多关卡铺好路。
+    地形、出生点、终点、金币、机关全部来自 levels/*.txt，代码里不再硬编码
+    任何关卡数据。这样可以只改文本就调整关卡，也为 M6 多关卡铺好路。
     """
 
     name = "game"
@@ -320,14 +320,23 @@ class GameScene(Scene):
         self.sprites = None       # assets.HeroSprites；None 表示退回代码绘制
         self.sprite_error = ""
         self.load_error = ""
+        self.level_path = getattr(app, "level_path", None) or config.DEFAULT_LEVEL
         self.goal_reached = False
         self.level_time = 0.0
-        self.deaths = 0           # M4 接正式死亡流程前只在调试里显示
         self._hud_bg = None
         # 非 None 时屏蔽键盘、直接采用这个轴值。
         # 无头截图和以后的录像回放都依赖它——否则 update() 每帧都会用
         # key.get_pressed() 覆盖外部写入的输入，自动化根本驱动不了角色。
         self.override_axis = None
+
+        # ---- 死亡与检查点（M4）----
+        self.deaths = 0
+        self.death_timer = 0.0        # >0 表示正在死亡定格
+        self.invuln = 0.0             # 重生后的短暂无敌
+        self.checkpoint = None        # 当前重生点 (x, y)；None 表示回出生点
+        self.checkpoint_index = -1
+        self.last_death_cause = ""
+        self.respawn_count = 0        # 自检用：真正发生了几次重生
 
     # ---------------------------------------------------------------- 生命周期
     def on_enter(self):
@@ -335,9 +344,20 @@ class GameScene(Scene):
         self.show_debug = True
         self._focused = True
         self.override_axis = None
-        self.load_level(config.DEFAULT_LEVEL)
+        self._reset_stats()
+        self.load_level(self.level_path)
         self._load_sprites()
         self._build_hud()
+
+    def _reset_stats(self):
+        self.deaths = 0
+        self.death_timer = 0.0
+        self.invuln = 0.0
+        self.checkpoint = None
+        self.checkpoint_index = -1
+        self.last_death_cause = ""
+        self.respawn_count = 0
+        self.level_time = 0.0
 
     def load_level(self, path):
         """加载关卡。失败时把错误留在 self.load_error 里，画面显示出来。
@@ -349,8 +369,8 @@ class GameScene(Scene):
         self.player = None
         self.camera = None
         self.goal_reached = False
-        self.level_time = 0.0
         self.load_error = ""
+        self.level_path = path
         try:
             self.world = world.World.load(path)
         except world.LevelError as exc:
@@ -367,6 +387,22 @@ class GameScene(Scene):
         self.camera = world.Camera((config.WIDTH, config.HEIGHT),
                                    self.world.bounds)
         self.camera.snap_to(self.player.rect)
+        return True
+
+    def restart(self):
+        """重开本关：保留已烘焙的地形，只复位运行期状态。
+
+        直接重新 load 一次也没错，但烘焙 2816x576 的地形要几十毫秒，
+        按 R 会看到明显停顿。地形是不变的，没必要重画。
+        """
+        if self.world is None:
+            return self.load_level(self.level_path)
+        self._reset_stats()
+        self.world.reset_runtime()
+        self.goal_reached = False
+        self.player = player.Player(*self.world.spawn)
+        self.camera.snap_to(self.player.rect)
+        self.input = player.InputState()
         return True
 
     def _load_sprites(self):
@@ -414,10 +450,13 @@ class GameScene(Scene):
             elif event.key == pygame.K_F1:
                 self.show_debug = not self.show_debug
             elif event.key == pygame.K_r:
-                # 重开本关：M7 会挂到正式 UI 上，现在先给个快捷键方便调试
-                self.on_enter()
+                self.restart()
+            elif event.key == pygame.K_t:
+                self.go_to_checkpoint()
+            elif event.key == pygame.K_n:
+                self.next_level()
             elif event.key == pygame.K_RETURN and self.goal_reached:
-                self.on_enter()
+                self.restart()
         elif event.type == pygame.KEYUP:
             if event.key == pygame.K_SPACE:
                 self.input.jump_released = True
@@ -432,6 +471,26 @@ class GameScene(Scene):
                 self.player.vx = 0.0
         elif compat.focus_gained(event):
             self._focused = True
+
+    def next_level(self):
+        """N 键切到下一个关卡文件。
+
+        M6 才做正式的选关界面；这里先给一个循环切换，是因为 M4 的机关
+        （篝火/地刺/弹跳板/移动平台）全在 l2 里，没有它就只能改代码试玩。
+        """
+        try:
+            names = sorted(n for n in os.listdir(config.LEVEL_DIR)
+                           if n.endswith(".txt"))
+        except OSError:
+            return False
+        if len(names) < 2:
+            return False
+        cur = os.path.basename(self.level_path)
+        i = names.index(cur) if cur in names else -1
+        self.level_path = os.path.join(config.LEVEL_DIR, names[(i + 1) % len(names)])
+        self._reset_stats()
+        self.load_level(self.level_path)
+        return True
 
     def _poll_axis(self):
         if self.override_axis is not None:
@@ -454,7 +513,19 @@ class GameScene(Scene):
             return
 
         self._poll_axis()
+        # 平台先动一步：玩家这一帧要撞的是平台的**新**位置，
+        # 否则站在平台前沿时会被追尾，表现为每帧一次的小顿挫。
         self.world.update(dt)
+
+        # 死亡定格：角色不再受物理控制，也不再计时。
+        # 不在这里 return 掉 world.update 是故意的——平台继续走，
+        # 画面不会僵住，玩家能看清"我是在哪个机关上死的"。
+        if self.death_timer > 0.0:
+            self.death_timer = max(0.0, self.death_timer - dt)
+            self.input.release_edges()
+            if self.death_timer <= 0.0:
+                self._respawn()
+            return
 
         if self.goal_reached:
             # 到终点后冻结角色，但仍让输入边沿自然衰减，避免重开时残留按键
@@ -462,25 +533,112 @@ class GameScene(Scene):
             return
 
         self.level_time += dt
-        self.player.update(dt, self.input, self.world.solids)
-        self.world.collect(self.player.rect)
+        if self.invuln > 0.0:
+            self.invuln = max(0.0, self.invuln - dt)
+
+        self._apply_platform_carry()
+        self.player.update(dt, self.input, self.world.collision_solids(),
+                           oneways=self.world.oneways,
+                           bouncers=self.world.bouncers)
+        self._post_physics()
         self.camera.update(dt, self.player.rect)
 
-        # 掉出地图：M3 先做最简回出生点，保证坑里不会无限下坠。
-        # M4 会换成统一的死亡流程（死亡计数、篝火重生、短暂无敌）。
-        if self.player.y > self.world.bounds.bottom + 120:
-            self.respawn()
+    def _apply_platform_carry(self):
+        """站着的平台动了，玩家跟着走。
 
-        if self.player.rect.colliderect(self.world.goal_rect):
+        先水平后垂直，和 _move_horizontal/_move_vertical 里的顺序保持一致。
+        用平台自己算出的整数 delta，而不是"速度 × dt"：这样平台和玩家的
+        位置差永远不超过 1px，不会出现慢慢累积的半像素偏移。
+        """
+        p = self.player
+        if not p.on_ground:
+            return
+        plat = self.world.carrying_platform(p)
+        if plat is None:
+            return
+        dx, dy = plat.delta
+        if dx or dy:
+            p.carry(dx, dy, self.world.solids)
+
+    def _post_physics(self):
+        """物理之后的一次性判定：死亡、篝火、金币、终点。
+
+        顺序有讲究：先判死亡再判篝火。玩家可能正好被弹进篝火旁的刺里，
+        这时应该死，不该顺手点亮一盏离他很远的篝火。
+        """
+        p = self.player
+        rect = p.rect
+
+        # 掉出地图底部：坑没接住，等同于死亡
+        if rect.top > self.world.bounds.bottom:
+            self.die(u"掉出了地图")
+            return
+
+        if self.invuln <= 0.0:
+            ch = self.world.hazard_at(rect)
+            if ch is not None:
+                self.die({"^": u"踩到地刺", "v": u"撞到天花板刺",
+                          "~": u"落水"}.get(ch, u"碰到危险格"))
+                return
+
+        idx = self.world.checkpoint_hit(rect)
+        if idx >= 0:
+            # 只允许往关卡后面点亮：回头看老篝火时不该把重生点往回挪
+            if idx > self.checkpoint_index:
+                cp = self.world.checkpoints[idx]
+                cp["active"] = True
+                self.checkpoint = cp["spawn"]
+                self.checkpoint_index = idx
+                print(u" 检查点   : 第 %d 个篝火点亮，重生点 (%.0f, %.0f)"
+                      % (idx + 1, cp["spawn"][0], cp["spawn"][1]))
+
+        self.world.collect(rect)
+
+        if rect.colliderect(self.world.goal_rect) and not self.goal_reached:
             self.goal_reached = True
             self.input.release_edges()
-            print(u" 到达终点：%.1fs，金币 %d/%d" % (
-                self.level_time, self.world.taken_coins, self.world.total_coins))
+            print(u" 到达终点：%.1fs，金币 %d/%d，死亡 %d 次" % (
+                self.level_time, self.world.taken_coins,
+                self.world.total_coins, self.deaths))
 
-    def respawn(self):
-        self.player.reset()
-        if self.camera is not None:
-            self.camera.snap_to(self.player.rect)
+    # ---------------------------------------------------------------- 死亡与重生
+    def die(self, cause=u"死亡"):
+        """进入死亡流程。重复调用被 death_timer 挡掉，死亡数只加一次。"""
+        if self.death_timer > 0.0 or self.goal_reached:
+            return
+        self.deaths += 1
+        self.last_death_cause = cause
+        self.death_timer = config.DEATH_FREEZE
+        self.player.vx = 0.0
+        self.player.vy = 0.0
+        self.player.dash_time = 0.0
+        self.input.release_edges()
+
+    def _respawn(self):
+        """按当前重生点复活。检查点优先，没点过篝火就回出生点。"""
+        if self.checkpoint is not None:
+            x, y = self.checkpoint
+        else:
+            x, y = self.world.spawn
+        self.player.teleport(x, y)
+        self.invuln = config.INVULN_TIME
+        self.respawn_count += 1
+        self.camera.snap_to(self.player.rect)
+
+    def go_to_checkpoint(self):
+        """T 键：主动回检查点。刻意不算死亡——这是读档不是送死。"""
+        if self.world is None or self.goal_reached:
+            return False
+        if self.checkpoint is None:
+            # 还没点篝火。回出生点也算"回到上一个安全位置"，但不计死亡
+            x, y = self.world.spawn
+        else:
+            x, y = self.checkpoint
+        self.death_timer = 0.0
+        self.player.teleport(x, y)
+        self.invuln = config.INVULN_TIME
+        self.camera.snap_to(self.player.rect)
+        return True
 
     # ---------------------------------------------------------------- 绘制
     def draw(self, surface):
@@ -494,17 +652,19 @@ class GameScene(Scene):
         self._draw_player(surface)
         self._draw_hud(surface)
 
-        if self.show_debug:
+        if self.show_debug and self.death_timer <= 0.0:
             self._draw_debug(surface)
 
         f_hint, _ = get_font(16)
-        hint = (u"← → / A D 移动     空格 跳跃     Shift 冲刺     "
-                u"R 重开     F1 调试     Esc 返回菜单")
+        hint = (u"← → / A D 移动   空格 跳跃   Shift 冲刺   "
+                u"T 回检查点   R 重开   N 切关   F1 调试   Esc 菜单")
         w = f_hint.size(hint)[0]
         surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
                      ((config.WIDTH - w) // 2, config.HEIGHT - 26))
 
-        if self.goal_reached:
+        if self.death_timer > 0.0:
+            self._draw_death_panel(surface)
+        elif self.goal_reached:
             self._draw_goal_panel(surface)
 
     def _draw_player(self, surface):
@@ -519,6 +679,10 @@ class GameScene(Scene):
         p = self.player
         ox, oy = self.camera.offset
         self._draw_dash_trail(surface, ox, oy)
+        # 重生后的无敌时间用闪烁表达。不闪的话玩家会以为"我明明碰到刺了
+        # 却没死"，闪起来才像"刚复活、还在缓冲期"。
+        if self.invuln > 0.0 and int(self.invuln / 0.06) % 2 == 0:
+            return
         if self.sprites is None:
             draw_stick_figure(surface, p.rect.centerx + ox, p.rect.bottom + oy)
             return
@@ -567,6 +731,8 @@ class GameScene(Scene):
         surface.blit(f.render(self._level_title(), True, config.COLOR_INK), (30, 22))
         coins = u"金币 %d / %d" % (self.world.taken_coins, self.world.total_coins)
         surface.blit(f_small.render(coins, True, config.COLOR_MUTED), (30, 48))
+        deaths = u"死亡 %d" % self.deaths
+        surface.blit(f_small.render(deaths, True, config.COLOR_MUTED), (152, 48))
 
         t = u"%05.1f s" % self.level_time
         tw = f_small.size(t)[0]
@@ -596,6 +762,43 @@ class GameScene(Scene):
                                          fill, bar.height - 2))
         pygame.draw.rect(surface, config.COLOR_INK, bar, 1)
 
+    def _draw_death_panel(self, surface):
+        """死亡定格画面。
+
+        刻意不做满屏红或大爆炸：整个游戏是纸面手绘风，死一次就闪红光
+        会很突兀。用一层很淡的纸色纱 + 手写感的"×"更统一，也让玩家
+        在被定格这 0.45 秒里仍能看清自己是怎么死的。
+        """
+        veil = pygame.Surface((config.WIDTH, config.HEIGHT), pygame.SRCALPHA)
+        veil.fill((250, 247, 238, 150))
+        surface.blit(veil, (0, 0))
+
+        box = pygame.Rect(0, 0, 380, 148)
+        box.center = (config.WIDTH // 2, config.HEIGHT // 2 - 20)
+        compat.panel(surface, box, radius=18, fill=(255, 255, 255),
+                     border=config.COLOR_INK, width=3)
+
+        f_big, _ = get_font(40, bold=True)
+        f, _ = get_font(17)
+        mark = f_big.render(u"×", True, config.COLOR_INK)
+        surface.blit(mark, (box.centerx - mark.get_width() // 2, box.top + 8))
+
+        cause = f.render(self.last_death_cause or u"死亡", True, config.COLOR_INK)
+        surface.blit(cause, (box.centerx - cause.get_width() // 2, box.top + 62))
+
+        where = (u"回到第 %d 个篝火" % (self.checkpoint_index + 1)
+                 if self.checkpoint is not None else u"回到出生点")
+        tip = f.render(where, True, config.COLOR_MUTED)
+        surface.blit(tip, (box.centerx - tip.get_width() // 2, box.top + 88))
+
+        # 定格剩余时间条：让"还要等一下"变成可见的东西，避免玩家按了一遍键
+        bar = pygame.Rect(box.left + 30, box.bottom - 26, box.width - 60, 6)
+        pygame.draw.rect(surface, (232, 228, 218), bar)
+        ratio = self.death_timer / max(1e-6, config.DEATH_FREEZE)
+        pygame.draw.rect(surface, config.COLOR_INK,
+                         pygame.Rect(bar.left, bar.top,
+                                     int(bar.width * (1.0 - ratio)), bar.height))
+
     def _draw_goal_panel(self, surface):
         box = pygame.Rect(0, 0, 420, 190)
         box.center = (config.WIDTH // 2, config.HEIGHT // 2 - 10)
@@ -609,9 +812,9 @@ class GameScene(Scene):
         f, _ = get_font(18)
         lines = [
             (u"到达终点", f_big, config.COLOR_INK),
-            (u"用时 %.1f 秒    金币 %d / %d" % (self.level_time,
-                                              self.world.taken_coins,
-                                              self.world.total_coins),
+            (u"用时 %.1f 秒    金币 %d / %d    死亡 %d 次"
+             % (self.level_time, self.world.taken_coins,
+                self.world.total_coins, self.deaths),
              f, config.COLOR_MUTED),
             (u"Enter 重来    Esc 返回菜单", f, config.COLOR_MUTED),
         ]
@@ -645,6 +848,10 @@ class GameScene(Scene):
         cam = self.camera
         lines.append("cam  %.1f, %.1f  off %s"
                      % (cam.x, cam.y, cam.offset))
+        lines.append("deaths %d  invuln %.2f  cp %s"
+                     % (self.deaths, self.invuln,
+                        "-" if self.checkpoint is None
+                        else "%d" % (self.checkpoint_index + 1)))
         box = pygame.Rect(16, 112, 380, 16 + 20 * len(lines))
         pygame.draw.rect(surface, (255, 255, 255), box)
         pygame.draw.rect(surface, config.COLOR_INK, box, 2)
