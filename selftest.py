@@ -506,6 +506,52 @@ def test_platform():
            u"y %.0f -> %.0f" % (y0, plat2.rect.y))
 
 
+def test_platform_squeeze():
+    _section(u"M4 平台挤压（瞬移回归）")
+
+    # 站着不动，升降台从 500 一路降下来扫过玩家的头。老实现只要发生 1px
+    # 重叠就按"从上面落下来"处理，把人从台底整块吸到台面（实测 101px）。
+    ground = pygame.Rect(0, 640, 800, 128)
+    lift = pygame.Rect(300, 500, 64, 32)
+    p = player.Player(310, 640 - player.Player.HEIGHT)
+    inp = player.InputState()
+    start_x = p.x
+    prev = p.y
+    worst = 0.0
+    deepest = 0.0
+    for i in range(220):
+        lift.y += 1                       # 比实际平台（1.5px/帧）更狠
+        inp.jump_pressed = (i % 25 == 0)
+        inp.jump_held = (i % 25 < 8)
+        inp.jump_released = (i % 25 == 8)
+        p.update(DT, inp, [ground, lift])
+        worst = max(worst, abs(p.y - prev))
+        deepest = max(deepest, p.rect.bottom - ground.top)
+        prev = p.y
+
+    _check(u"升降台压到头顶不会把人吸到台面上", worst <= 12.0,
+           u"最大单帧竖直位移 %.1f px" % worst)
+    _check(u"被压时不会陷进地面", deepest <= player.Player.SKIM_PX + 1.0,
+           u"最深 %.1f px（容差 %.0f）" % (deepest, player.Player.SKIM_PX))
+    _check(u"被压时会把人挤到旁边", abs(p.x - start_x) > 1.0,
+           u"x %.1f -> %.1f" % (start_x, p.x))
+    _check(u"挤出去之后没有掉进地面", p.rect.bottom <= ground.top + 1.0,
+           u"脚底 %.1f 地面 %d" % (p.rect.bottom, ground.top))
+
+    # 反过来：玩家自己往上跳，头顶撞到平台下沿，只能被挡住，不能穿上去
+    p2 = player.Player(310, 640 - player.Player.HEIGHT)
+    ceiling = pygame.Rect(280, 450, 120, 48)          # 底边 498，头顶在 570
+    inp2 = player.InputState()
+    top_seen = 9999.0
+    for i in range(40):
+        inp2.jump_pressed = (i == 0)
+        inp2.jump_held = True
+        p2.update(DT, inp2, [ground, ceiling])
+        top_seen = min(top_seen, p2.y)
+    _check(u"跳起来撞到天花板会被挡住", top_seen >= ceiling.bottom - 1.0,
+           u"最高头顶 %.1f（天花板底 %d）" % (top_seen, ceiling.bottom))
+
+
 def test_m4_scene(app):
     _section(u"M4 死亡 / 检查点 / 平台带动")
 
@@ -1157,6 +1203,7 @@ def run(app):
     test_oneway()
     test_bouncer()
     test_platform()
+    test_platform_squeeze()
     test_m4_scene(app)
     test_level_parse()
     test_level_errors()

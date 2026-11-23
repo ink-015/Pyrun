@@ -49,6 +49,14 @@ class Player(object):
 
     WIDTH = 26
     HEIGHT = 70
+    # 竖直方向只擦到这么多像素，就当作"没碰上"放过去。
+    # 移动平台会主动扫过玩家的头顶/脚底，这个阈值以下做任何位置修正都会
+    # 变成一次看得见的瞬移（或被按进地面），而放着不管玩家自己察觉不到。
+    SKIM_PX = 6.0
+    # 横向那一步的容差要更紧：这里是"算不算撞墙"，放宽到 6px 就允许人
+    # 侧身滑进墙里半个身子（实测穿模帧数从 0 涨到几十）。4px 只够吃掉
+    # 平台边缘扫过来的那点重叠。
+    SIDE_SKIM_PX = 4.0
 
     def __init__(self, x, y):
         self.spawn = (float(x), float(y))
@@ -347,17 +355,119 @@ class Player(object):
     def _move_horizontal(self, dx, solids):
         if dx == 0.0:
             return
+        start_x = self.x
         self.x += dx
         r = self.rect
         for s in solids:
             if not r.colliderect(s):
                 continue
-            if dx > 0:
-                self.x = s.left - self.WIDTH
+            # 竖直方向只擦到一条边（升降台升起来压到头顶、或从下面兜住
+            # 脚底）不算"撞墙"。不排除掉的话，横向那一步会把人从平台边上
+            # 整块弹出去，直接弹进旁边的实心地形里。
+            if self._v_overlap(r, s) <= self.SIDE_SKIM_PX:
+                continue
+            if start_x + self.WIDTH <= s.left + 1.0:
+                self.x = float(s.left) - self.WIDTH
+            elif start_x >= s.right - 1.0:
+                self.x = float(s.right)
             else:
-                self.x = s.right
+                # 从侧向挤进来（移动平台横向顶过来）：往穿透浅的一侧让。
+                # 让出去的位置如果会压进别的实心（比如贴墙那一格），就换另
+                # 一侧；两侧都不行就原地不动，绝不把人生塞进墙里。
+                pen_left = (self.x + self.WIDTH) - s.left
+                pen_right = s.right - self.x
+                left_x = float(s.left) - self.WIDTH
+                right_x = float(s.right)
+                if pen_left < pen_right:
+                    first, second = left_x, right_x
+                else:
+                    first, second = right_x, left_x
+                if self._fits(first, self.y, solids, s):
+                    self.x = first
+                elif self._fits(second, self.y, solids, s):
+                    self.x = second
+                else:
+                    self.x = start_x
             self.vx = 0.0
             r = self.rect
+
+    def _v_overlap(self, rect, s):
+        """两个矩形在竖直方向上的重叠厚度。"""
+        return min(rect.bottom, s.bottom) - max(rect.top, s.top)
+
+    def _fits(self, x, y, solids, ignore=None):
+        """把玩家摆到 (x, y) 上会不会压进实心。
+
+        原本就只擦着边的接触不算压进去——那种重叠是移动平台从头顶扫过去
+        造成的，不该用来否掉所有候选位置。否则解算会一路往下试，最后挑中
+        "落到地面底边"，人直接被塞到地图底下掉出去。判据是"新位置没有比
+        原位置压得更深"，压深了照样不合格。
+        """
+        cand = pygame.Rect(int(round(x)), int(round(y)),
+                           self.WIDTH, self.HEIGHT)
+        old = self.rect
+        for s in solids:
+            if s is ignore:
+                continue
+            if not cand.colliderect(s):
+                continue
+            if old.colliderect(s):
+                if self._v_overlap(old, s) <= self.SKIM_PX \
+                        and self._v_overlap(cand, s) <= self.SKIM_PX:
+                    continue
+            return False
+        return True
+
+    def _eject_sideways(self, s, y, solids):
+        """把玩家从 s 的横向范围里推出去，推得动返回 True。
+
+        站在地面上被平台从头顶压下来时用：平台行程固定，早晚会压到底，
+        竖向解算只能把人顶到平台顶面（一次 60px 以上的瞬移）或者按进地面
+        （直接穿地掉出地图）。横向推出去是唯一既安全又符合直觉的解。
+        """
+        left_x = float(s.left) - self.WIDTH
+        right_x = float(s.right)
+        if abs(self.x - left_x) <= abs(self.x - right_x):
+            order = (left_x, right_x)
+        else:
+            order = (right_x, left_x)
+        for cand in order:
+            if self._fits(cand, y, solids, s):
+                self.x = cand
+                return True
+        return False
+
+    def _resolve_down(self, s, start_bottom, before, solids):
+        """下落撞到实体时，人该停在哪一条 y 上。
+
+        老实现无条件按"落在顶面"解算。地形不动时这是对的，但移动平台会
+        自己顶进玩家身体：升降台从上方压到头顶时，那颗 0.8px 的浅重叠会被
+        当成"从上面落下来"，人被整块吸到台面上——从台底吸到台顶，实测一次
+        101px，看起来就是"瞬移"。
+
+        所以按"从哪一侧进来"分三种：
+          脚底出发时就在顶面之上 → 正常落地；
+          从底面进来（头顶被压）→ 站着就让到旁边，空中就擦过去；
+          其余（平台升起来顶到脚底）→ 站回顶面，这就是电梯托人。
+        """
+        top = float(s.top) - self.HEIGHT
+        if start_bottom <= s.top + 1.0:
+            return top
+        pen_top = (self.y + self.HEIGHT) - s.top      # 从顶面陷进去多深
+        pen_bottom = s.bottom - self.y                # 从底面陷进去多深
+        if pen_bottom < pen_top:
+            # 从下面进来的
+            if pen_bottom > self.SKIM_PX and self.on_ground:
+                if self._eject_sideways(s, before, solids):
+                    return before
+            # 空中擦头，或者旁边根本让不出去：不做位置修正，擦着过去。
+            # 真按最小穿透推，人会被按进脚下地面（实测穿地掉出地图）。
+            # 返回 None 而不是当前 y：这一下不算"撞上"，下面那块地面还得
+            # 照常解算，否则人会一直嵌在地面里。
+            return None
+        if self._fits(self.x, top, solids, s):
+            return top
+        return before
 
     def _move_vertical(self, dy, solids, oneways=None, bouncers=None):
         if dy == 0.0:
@@ -369,7 +479,9 @@ class Player(object):
         # 出发时的脚底位置决定单向平台这次是否该挡人：从下往上穿时
         # 脚底在平台下方，此时不能挡；从上方落下来才挡。
         start_bottom = self.y + self.HEIGHT
+        start_y = self.y
         for _ in range(steps):
+            before = self.y
             self.y += part
             r = self.rect
             blocked = False
@@ -377,10 +489,23 @@ class Player(object):
                 if not r.colliderect(s):
                     continue
                 if dy > 0:
-                    self.y = s.top - self.HEIGHT
-                    self.on_ground = True
+                    new_y = self._resolve_down(s, start_bottom, before, solids)
+                    if new_y is None:
+                        # 擦边放过：不算撞上，继续检查剩下的实心
+                        continue
+                    self.y = new_y
+                    # 只有真的停在顶面上才算落地；被从下方推出来不算
+                    if abs(self.y + self.HEIGHT - s.top) < 0.51:
+                        self.on_ground = True
                 else:
-                    self.y = s.bottom
+                    # 向上：只有"从下往上顶到 s 的底边"才算撞天花板。
+                    # 不加这个前提的话，被别的东西顶进地板里的人会被解算成
+                    # "落到地板底面"——直接掉出地图。已经嵌在里面的情况也
+                    # 一律不推，玩家自己往下走就能出来。
+                    if start_y >= s.bottom - 1.0:
+                        self.y = float(s.bottom)
+                    else:
+                        continue
                 self.vy = 0.0
                 blocked = True
                 r = self.rect

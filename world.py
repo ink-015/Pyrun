@@ -255,16 +255,24 @@ class MovingPlatform(object):
         self.offset = 0.0          # 0..travel
         self.dir = 1               # +1 向行程末端（水平向右 / 垂直向上）
         self.delta = (0, 0)
+        self.dwell = 0.0           # 到端点后的停留倒计时
 
     def update(self, dt):
         old = (self.rect.x, self.rect.y)
+        if self.dwell > 0.0:
+            # 停在端点让人上下，delta 保持 0，站上面的玩家不会被抖
+            self.dwell = max(0.0, self.dwell - dt)
+            self.delta = (0, 0)
+            return
         self.offset += self.speed * dt * self.dir
         if self.offset >= self.travel:
             self.offset = self.travel
             self.dir = -1
+            self.dwell = config.PLATFORM_DWELL
         elif self.offset <= 0.0:
             self.offset = 0.0
             self.dir = 1
+            self.dwell = config.PLATFORM_DWELL
 
         if self.axis == "x":
             self.rect.x = int(round(self.origin[0] + self.offset))
@@ -616,6 +624,7 @@ class World(object):
         for p in self.platforms:
             p.offset = 0.0
             p.dir = 1
+            p.dwell = 0.0
             p.rect.x, p.rect.y = p.origin
             p.delta = (0, 0)
         self.goal_reached = False
