@@ -15,6 +15,7 @@ from __future__ import print_function
 
 import glob
 import io
+import locale
 import os
 import sys
 import time
@@ -52,10 +53,27 @@ def check(name, fn, level="FAIL"):
 
 
 # ---------------------------------------------------------------- 1. 运行时
+def sdl_label():
+    """pygame 1.9.6 没有 version.SDL 属性，不能直接取。"""
+    sdl = getattr(pygame.version, "SDL", None)
+    if isinstance(sdl, tuple):
+        return ".".join(str(x) for x in sdl)
+    if isinstance(sdl, str) and sdl:
+        return sdl
+    return "1.2（pygame 未暴露版本号，按 1.9.6 推定）"
+
+
+def is_sdl1():
+    """SDL 1.2 与 SDL 2 的事件模型不同，部分检查只在 SDL1 下成立。"""
+    sdl = getattr(pygame.version, "SDL", None)
+    if isinstance(sdl, tuple) and sdl:
+        return int(sdl[0]) < 2
+    return True
+
+
 def c_runtime():
-    sdl = getattr(pygame.version, "SDL", "?")
     return "Python %s / pygame %s / SDL %s" % (
-        sys.version.split()[0], pygame.version.ver, sdl)
+        sys.version.split()[0], pygame.version.ver, sdl_label())
 
 
 def c_display_depth():
@@ -144,21 +162,56 @@ def _tmpdir():
     return _tmpdir.d
 
 
+# ---------------------------------------------------------------- 3. 焦点事件（三套 SDL 模型）
+def c_focus_event():
+    """焦点事件在三个 pygame 版本上是三套不同模型，验证 compat 认得出当前这套。
+
+    用 event.Event 直接构造事件对象、不 post，避免依赖显示驱动是否过滤事件。
+    """
+    if hasattr(pygame, "WINDOWFOCUSLOST") and hasattr(pygame, "WINDOWFOCUSGAINED"):
+        # pygame 2.6+：独立事件类型
+        lost = pygame.event.Event(pygame.WINDOWFOCUSLOST)
+        gained = pygame.event.Event(pygame.WINDOWFOCUSGAINED)
+    elif hasattr(pygame, "WINDOWEVENT") and hasattr(pygame, "WINDOWEVENT_FOCUS_LOST"):
+        # pygame 2.0~2.5：统一类型 + 子类型
+        lost = pygame.event.Event(pygame.WINDOWEVENT, {"event": pygame.WINDOWEVENT_FOCUS_LOST})
+        gained = pygame.event.Event(pygame.WINDOWEVENT, {"event": pygame.WINDOWEVENT_FOCUS_GAINED})
+    else:
+        # SDL 1.2：ACTIVEEVENT + state 位
+        lost = pygame.event.Event(pygame.ACTIVEEVENT, {"state": 2, "gain": 0})
+        gained = pygame.event.Event(pygame.ACTIVEEVENT, {"state": 2, "gain": 1})
+
+    assert compat.focus_lost(lost), "focus_lost() 没认出失去焦点事件"
+    assert compat.focus_gained(gained), "focus_gained() 没认出获得焦点事件"
+    assert not compat.focus_lost(gained), "获得焦点被误判为失去焦点"
+    assert not compat.focus_gained(lost), "失去焦点被误判为获得焦点"
+    return "%s，四种判定全对" % compat.focus_event_model()
+
+
 def c_utf8_roundtrip():
     tmp = os.path.join(_tmpdir(), "utf8.txt")
     text = u"第一关 · 中文\n第二行：跳跃\n"
     io_utils.write_text(tmp, text)
     back = io_utils.read_text(tmp)
     assert back == text, "往返内容不一致"
-    # 反向证明：直接用 open() 会崩
+
+    # 反证：默认编码不是 UTF-8 时，裸 open() 读 UTF-8 中文必然抛异常。
+    # 但如果解释器处于 UTF-8 模式（PYTHONUTF8=1、-X utf8、或 3.15+ 的默认行为），
+    # 裸 open() 也不会崩——那只是环境不同，不能判失败，否则换台机器就误报。
+    enc = locale.getpreferredencoding(False)
+    if enc.lower().replace("-", "").replace("_", "") == "utf8":
+        return "io_utils 正常；默认编码 %s（UTF-8 模式），GBK 反证不适用" % enc
+
     crashed = False
     try:
         with io.open(tmp, "r") as f:
             f.read()
     except UnicodeDecodeError:
         crashed = True
-    assert crashed, "本机默认编码似乎不是 GBK，说明文档里的警告需要复核"
-    return "io_utils 正常；裸 open() 确实会 UnicodeDecodeError"
+    except LookupError:
+        crashed = True
+    assert crashed, "默认编码是 %s，裸 open() 却没崩，字符集假设需复核" % enc
+    return "io_utils 正常；默认编码 %s，裸 open() 确实 UnicodeDecodeError" % enc
 
 
 def c_json_roundtrip():
@@ -248,20 +301,32 @@ def c_font():
 
 
 # ---------------------------------------------------------------- 6. 语法与 API 静态扫描
-FORBIDDEN = [
-    ("border_radius", "pygame 2.0+ 参数，1.9.6 没有，改用 compat.rounded_rect"),
-    (".clipline(", "pygame 2.0+ 方法，改用 compat.clip_line"),
+# 分两类，因为它们的失效范围完全不同：
+#
+#  A. Python 3.7+ 语法/标准库 —— 任何环境都禁。哪怕当前用 3.11 跑得好好的，
+#     一旦回到海龟的 3.6 就是语法错误，交付验收会直接崩。
+#  B. pygame 2.0+ 专有 API —— 只在 pygame 1.9.6 下禁。用 3.11 开发时它们是合法的，
+#     而且写双环境兼容代码（例如焦点事件分支）必须用到，不能一律封杀。
+FORBIDDEN_PY = [
     ("math.dist(", "Python 3.8+，改用 compat.dist"),
-    ("pygame.SCALED", "pygame 2.0+，1.9.6 没有"),
     ("capture_output=", "Python 3.7+ subprocess 参数，改用 stdout=subprocess.PIPE"),
     ("from __future__ import annotations", "Python 3.7+"),
     ("import dataclasses", "Python 3.7+ 标准库（本机是 backport，不保证别人也有）"),
-    ("WINDOWFOCUSLOST", "SDL1.2 没有，改用 ACTIVEEVENT + event.gain"),
+]
+FORBIDDEN_PYGAME2 = [
+    ("border_radius", "pygame 2.0+ 参数，1.9.6 没有，改用 compat.rounded_rect"),
+    (".clipline(", "pygame 2.0+ 方法，改用 compat.clip_line"),
+    ("pygame.SCALED", "pygame 2.0+，1.9.6 没有"),
+    ("WINDOWFOCUSLOST", "SDL1.2 没有这个事件，需按 SDL 版本分支后再用"),
 ]
 ALLOW_FILES = {"compat.py", "envcheck.py"}
 
 
 def c_static_scan():
+    rules = list(FORBIDDEN_PY)
+    sdl1 = is_sdl1()
+    if sdl1:
+        rules += FORBIDDEN_PYGAME2
     hits = []
     for path in glob.glob(os.path.join(ROOT, "*.py")):
         base = os.path.basename(path)
@@ -275,11 +340,12 @@ def c_static_scan():
             stripped = line.strip()
             if stripped.startswith("#"):
                 continue
-            for pat, why in FORBIDDEN:
+            for pat, why in rules:
                 if pat in line:
                     hits.append("%s:%d 用了 %s（%s）" % (base, i, pat, why))
     assert not hits, "; ".join(hits[:4])
-    return "根目录 .py 无禁用 API"
+    scope = "SDL1 全表" if sdl1 else "SDL2 下仅 Python 兼容项"
+    return "根目录 .py 无禁用 API（%s，%d 条规则）" % (scope, len(rules))
 
 
 def c_walrus():
@@ -341,6 +407,7 @@ def main():
     check(u"线段裁剪 clip_line", c_clip_line)
     check(u"距离 dist", c_dist)
     check(u"功能色染色 tint", c_tint)
+    check(u"焦点事件分支", c_focus_event)
     check(u"UTF-8 读写 io_utils", c_utf8_roundtrip)
     check(u"JSON 读写", c_json_roundtrip)
     check(u"音频设备", c_mixer, level="SKIP")

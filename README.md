@@ -527,7 +527,7 @@ IDLE ──按方向──→ RUN ──离地──→ JUMP ──vy>0──→
 | **（已发生，已处置）** 无头模式显示面 8 位 | 高 | `set_mode` 显式 `depth=32`；统一用 `compat.make_display()` |
 | **（潜伏·高危）** Windows 默认 GBK，`open()` 读 UTF-8 中文抛 `UnicodeDecodeError` | 高 | 文本读写一律走 `io_utils.read_text/write_text/read_json/write_json`；加载第一关时必然触发 |
 | **（潜伏）** 无音频设备时 `mixer.init()` 抛 `error: No available audio device` | 中 | `try/except` 后置 `audio_enabled=False`，游戏照常运行，只是没声音 |
-| **（潜伏）** SDL 1.2 无 `WINDOWFOCUSLOST`，Alt+Tab 后按键可能卡住 | 中 | 监听 `ACTIVEEVENT` + `event.state & 2`（`APPINPUTFOCUS` 常量也未暴露，手写 `=2`），失焦时清空输入并暂停 |
+| **（潜伏）** 焦点事件三套模型（SDL1 `ACTIVEEVENT` / pygame2.0~2.5 `WINDOWEVENT` / pygame2.6 独立类型），Alt+Tab 后按键可能卡住 | 中 | 统一走 `compat.focus_lost/focus_gained`，内部按常量探测分三支，业务代码不写版本判断 |
 | **（潜伏）** `smoothscale` 大图 7.68ms、`panel` 0.75ms | 中 | 缩放只在加载期做；UI 面板渲染一次后缓存复用，禁止每帧重画 |
 | 中文字体找不到（`simkai.ttf`） | 低 | 依次尝试 `simkai.ttf → msyh.ttc → 自带字体 → 英文 UI`；字体路径集中在 `config.py` |
 | OGG 无法播放 | 低 | 提供 `tools/ogg2wav.py` 一键转换，`assets.py` 优先找 `.ogg` 再找 `.wav` |

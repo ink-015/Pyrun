@@ -48,6 +48,7 @@ def report_environment():
     print("=" * 56)
     print(" pygame :", pygame.version.ver)
     print(" python :", sys.version.split()[0])
+    print(" 焦点   :", compat.focus_event_model())
     print(" 根目录 :", config.BASE_DIR)
 
     missing_dirs, missing_files = config.check_environment()

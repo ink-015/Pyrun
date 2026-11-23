@@ -143,3 +143,74 @@ def make_display(size, depth=32):
         return pygame.display.set_mode(size, 0, depth)
     except Exception:
         return pygame.display.set_mode(size)
+
+
+# ---------------------------------------------------------------- 焦点事件
+# 这是**事件模型**层面的差异，不是单纯 API 缺失，兼容层必须真的分支。
+# 实测三种形态（2026-11-23）：
+#
+#   pygame 1.9.6 / SDL 1.2 : 只有 ACTIVEEVENT，焦点在 state 位掩码里
+#                            （APPINPUTFOCUS=2；gain=0 表示失去）
+#   pygame 2.0 ~ 2.5       : WINDOWEVENT 统一事件类型 + 子类型
+#                            WINDOWEVENT_FOCUS_LOST / _GAINED
+#   pygame 2.6+            : **不再有 WINDOWEVENT**，拆成独立事件类型
+#                            WINDOWFOCUSLOST=32786 / WINDOWFOCUSGAINED=32785
+#
+# 教训：不能按 pygame 版本号猜 API（2.0 和 2.6 就是两套），
+# 只能按常量是否存在来探测。所以下面全部走 getattr，取不到即 None。
+
+_SDL_APPINPUTFOCUS = 2  # SDL 1.2 的 SDL_APPINPUTFOCUS 位，pygame 1.9.6 未暴露
+
+_ACTIVEEVENT = getattr(pygame, "ACTIVEEVENT", None)
+_WINDOWFOCUSLOST = getattr(pygame, "WINDOWFOCUSLOST", None)
+_WINDOWFOCUSGAINED = getattr(pygame, "WINDOWFOCUSGAINED", None)
+_WINDOWEVENT = getattr(pygame, "WINDOWEVENT", None)
+_WINDOWEVENT_FOCUS_LOST = getattr(pygame, "WINDOWEVENT_FOCUS_LOST", None)
+_WINDOWEVENT_FOCUS_GAINED = getattr(pygame, "WINDOWEVENT_FOCUS_GAINED", None)
+
+
+def sdl_major():
+    """SDL 主版本号，**仅用于打印显示**，不要拿它做行为分支。"""
+    sdl = getattr(pygame.version, "SDL", None)
+    if isinstance(sdl, tuple) and sdl:
+        try:
+            return int(sdl[0])
+        except (TypeError, ValueError):
+            return 1
+    return 1
+
+
+def focus_event_model():
+    """当前解释器用的是哪套焦点事件，供自检与启动日志显示。"""
+    if _WINDOWFOCUSLOST is not None or _WINDOWFOCUSGAINED is not None:
+        return "SDL2 独立事件类型 WINDOWFOCUSLOST"
+    if _WINDOWEVENT is not None and _WINDOWEVENT_FOCUS_LOST is not None:
+        return "SDL2 WINDOWEVENT + 子类型"
+    return "SDL1 ACTIVEEVENT + state 位"
+
+
+def focus_lost(event):
+    """事件是否为"窗口失去键盘焦点"（Alt+Tab 切走、点了别的窗口）。
+
+    失焦时必须清空按键快照并暂停，否则收不到 keyup，回来时角色会一直跑。
+    """
+    t = event.type
+    if _WINDOWFOCUSLOST is not None and t == _WINDOWFOCUSLOST:
+        return True
+    if _WINDOWEVENT is not None and t == _WINDOWEVENT and _WINDOWEVENT_FOCUS_LOST is not None:
+        return getattr(event, "event", None) == _WINDOWEVENT_FOCUS_LOST
+    if _ACTIVEEVENT is not None and t == _ACTIVEEVENT:
+        return bool(getattr(event, "state", 0) & _SDL_APPINPUTFOCUS) and not getattr(event, "gain", 1)
+    return False
+
+
+def focus_gained(event):
+    """事件是否为"窗口重新获得键盘焦点"。"""
+    t = event.type
+    if _WINDOWFOCUSGAINED is not None and t == _WINDOWFOCUSGAINED:
+        return True
+    if _WINDOWEVENT is not None and t == _WINDOWEVENT and _WINDOWEVENT_FOCUS_GAINED is not None:
+        return getattr(event, "event", None) == _WINDOWEVENT_FOCUS_GAINED
+    if _ACTIVEEVENT is not None and t == _ACTIVEEVENT:
+        return bool(getattr(event, "state", 0) & _SDL_APPINPUTFOCUS) and bool(getattr(event, "gain", 0))
+    return False
