@@ -8,12 +8,17 @@ M2 物理部分是纯逻辑，只操作 Player + Rect，不读键盘、不画图
 每条断言都对应 README §19 的某一项验收，不许靠手感。
 """
 
+import os
+import tempfile
+
 import pygame
 
 import assets
 import config
+import io_utils
 import player
 import scenes
+import world
 
 DT = config.FIXED_DT
 RESULTS = []
@@ -533,6 +538,229 @@ def test_land_feel():
     _check(u"下沉自动回弹", p.land_sink < 0.01, u"%.3f px" % p.land_sink)
 
 
+# ---------------------------------------------------------------- M3 地图与相机
+
+def _temp_level(name, text):
+    """把地图写到临时目录，用于构造各种错误样本。"""
+    folder = tempfile.mkdtemp(prefix="pyrun_lv_")
+    path = os.path.join(folder, name)
+    io_utils.write_text(path, text)
+    return path
+
+
+def test_level_parse():
+    _section(u"M3 关卡解析")
+
+    w = world.World.load(config.DEFAULT_LEVEL)
+    _check(u"地图尺寸 44x9", (w.width_tiles, w.height_tiles) == (44, 9),
+           u"%d x %d 格" % (w.width_tiles, w.height_tiles))
+
+    # 出生点：第 3 列第 6 行，脚底正好压在第 7 行上沿
+    want = (3 * config.TILE + (config.TILE - player.Player.WIDTH) // 2,
+            7 * config.TILE - player.Player.HEIGHT)
+    _check(u"出生点位置正确", w.spawn == want,
+           u"spawn=%s 期望=%s" % (w.spawn, want))
+
+    gy = 7 * config.TILE + 10
+    _check(u"起始地面为实心", w.is_solid_px(64, gy), u"col 1 / row 7")
+    _check(u"第 12 列是坑",
+           not w.is_solid_px(12 * config.TILE + 10, gy), u"col 12 应为空气")
+    _check(u"坑通到地图底部",
+           not w.is_solid_px(12 * config.TILE + 10, 8 * config.TILE + 10),
+           u"row 8 也是空气，掉下去才会出界")
+    _check(u"第 22-23 列是 2 格宽坑",
+           not w.is_solid_px(22 * config.TILE + 10, gy)
+           and not w.is_solid_px(23 * config.TILE + 10, gy), u"宽度 128px")
+
+    # 坑宽必须小于角色水平跨越能力，否则关卡不可通
+    airtime = 2.0 * abs(config.JUMP_SPEED) / config.GRAVITY_UP
+    reach = config.RUN_SPEED * airtime
+    _check(u"坑宽小于跨越能力", 2 * config.TILE < reach,
+           u"最宽坑 128px < 跨越 %.0fpx" % reach)
+
+    gc, gr = w.goal_cells[0]
+    _check(u"终点在第 41 列第 6 行", (gc, gr) == (41, 6),
+           u"cell=(%d,%d)" % (gc, gr))
+    _check(u"终点判定格与格子对齐",
+           w.goal_rect == pygame.Rect(41 * config.TILE, 6 * config.TILE,
+                                      config.TILE, config.TILE),
+           u"rect=%s" % (w.goal_rect,))
+    _check(u"终点踩在地面上",
+           w.is_solid_px(w.goal_rect.centerx, w.goal_rect.bottom + 8),
+           u"旗子下方是实心地面")
+
+    _check(u"金币 9 枚", w.total_coins == 9, u"%d 枚" % w.total_coins)
+
+    area = sum(r.width * r.height for r in w.solids)
+    _check(u"碰撞矩形已合并", len(w.solids) <= 8,
+           u"%d 格 -> %d 个矩形" % (len(w.solid_cells), len(w.solids)))
+    _check(u"合并未丢失面积", area == len(w.solid_cells) * config.TILE ** 2,
+           u"面积 %d px^2" % area)
+
+
+def test_level_errors():
+    _section(u"M3 解析报错")
+
+    bad_char = "\n".join([
+        "....",
+        "..P.",
+        "..x.",      # 第 3 行第 3 列是未知字符
+        "####",
+    ])
+    path = _temp_level("bad_char.txt", bad_char)
+    try:
+        world.World.load(path)
+        msg = u"（没有报错）"
+    except world.LevelError as exc:
+        msg = exc.describe()
+    _check(u"未知字符报文件名+行号", "bad_char.txt:3" in msg and ":3" in msg,
+           msg.splitlines()[0] if msg else u"")
+
+    bad_width = "\n".join(["....", "..P.", "..F.", "####", "###"])
+    path = _temp_level("bad_width.txt", bad_width)
+    try:
+        world.World.load(path)
+        msg = u"（没有报错）"
+    except world.LevelError as exc:
+        msg = exc.describe()
+    _check(u"行宽不一致报行号", "bad_width.txt:5" in msg,
+           msg.splitlines()[0] if msg else u"")
+
+    no_spawn = "\n".join(["....", "...F", "####"])
+    path = _temp_level("no_spawn.txt", no_spawn)
+    try:
+        world.World.load(path)
+        msg = u"（没有报错）"
+    except world.LevelError as exc:
+        msg = exc.describe()
+    _check(u"缺出生点会报错", u"出生点" in msg, msg.splitlines()[0] if msg else u"")
+
+    two_spawn = "\n".join([".P.P", "...F", "####"])
+    path = _temp_level("two_spawn.txt", two_spawn)
+    try:
+        world.World.load(path)
+        msg = u"（没有报错）"
+    except world.LevelError as exc:
+        msg = exc.describe()
+    _check(u"多个出生点会报错", u"只能有一个" in msg,
+           msg.splitlines()[0] if msg else u"")
+
+    no_goal = "\n".join(["....", "..P.", "####"])
+    path = _temp_level("no_goal.txt", no_goal)
+    try:
+        world.World.load(path)
+        msg = u"（没有报错）"
+    except world.LevelError as exc:
+        msg = exc.describe()
+    _check(u"缺终点会报错", u"终点" in msg, msg.splitlines()[0] if msg else u"")
+
+    path = _temp_level("absent.txt", "")
+    try:
+        world.World.load(os.path.join(os.path.dirname(path), "nope.txt"))
+        msg = u"（没有报错）"
+    except world.LevelError as exc:
+        msg = exc.describe()
+    _check(u"文件不存在会报错", u"不存在" in msg, msg.splitlines()[0] if msg else u"")
+
+
+def test_camera():
+    _section(u"M3 相机")
+
+    w = world.World.load(config.DEFAULT_LEVEL)
+    cam = world.Camera((config.WIDTH, config.HEIGHT), w.bounds)
+
+    # 出生点在关卡最左侧，相机必须被钳在左边界，不能露出地图外
+    cam.snap_to(pygame.Rect(w.spawn[0], w.spawn[1],
+                            player.Player.WIDTH, player.Player.HEIGHT))
+    _check(u"开局贴左边界", abs(cam.x) < 0.01, u"cam.x=%.2f" % cam.x)
+
+    # 跑到最右端：上限恰好是 地图宽 - 视口宽
+    far = pygame.Rect(w.bounds.right - 10, 378, player.Player.WIDTH,
+                      player.Player.HEIGHT)
+    cam.snap_to(far)
+    limit = w.bounds.width - config.WIDTH
+    _check(u"右侧贴右边界", abs(cam.x - limit) < 0.01,
+           u"cam.x=%.2f 上限 %d" % (cam.x, limit))
+
+    # 全程扫一遍，任何时候视口都不能越界
+    worst = 0.0
+    for col in range(w.width_tiles):
+        cam.snap_to(pygame.Rect(col * config.TILE, 378,
+                                player.Player.WIDTH, player.Player.HEIGHT))
+        v = cam.view_rect
+        worst = max(worst, -v.left, v.right - w.bounds.width,
+                    -v.top, v.bottom - w.bounds.height)
+    _check(u"视口全程不越界", worst <= 0.0, u"最大越界 %.2f px" % worst)
+
+    # 平滑跟随：一帧只走一部分，最终收敛到目标
+    # 位置选在关卡中段——贴边时相机被钳制，测不出平滑量
+    cam.snap_to(pygame.Rect(1400, 378, 26, 70))
+    start = cam.x
+    target = pygame.Rect(1600, 378, 26, 70)
+    cam.update(DT, target)
+    step = cam.x - start
+    # 指数平滑一帧约收敛 11%，200px 的距离一帧只该走 20px 上下
+    _check(u"单帧不是瞬移", 8.0 < step < 40.0,
+           u"目标距 200px，一帧前进 %.2f px" % step)
+
+    far_target = pygame.Rect(w.bounds.width - 40, 378, 26, 70)
+    for _ in range(240):
+        cam.update(DT, far_target)
+    want = min(far_target.centerx - config.WIDTH / 2.0, limit)
+    _check(u"最终收敛到目标", abs(cam.x - want) < 1.5,
+           u"cam.x=%.2f 目标 %.2f" % (cam.x, want))
+
+    # 地图比视口小时居中留白（README 允许的例外）
+    small = world.Camera((config.WIDTH, config.HEIGHT), pygame.Rect(0, 0, 400, 300))
+    _check(u"小地图水平居中", abs(small.x - (400 - config.WIDTH) / 2.0) < 0.01,
+           u"cam.x=%.1f" % small.x)
+    _check(u"小地图垂直居中", abs(small.y - (300 - config.HEIGHT) / 2.0) < 0.01,
+           u"cam.y=%.1f" % small.y)
+
+
+def test_level_playable():
+    _section(u"M3 第一关可通关")
+
+    w = world.World.load(config.DEFAULT_LEVEL)
+    p = player.Player(*w.spawn)
+    inp = player.InputState()
+    inp.axis = 1.0
+    inp.jump_held = True          # 一直按住，跳满高度才够跨 2 格坑
+
+    frames = 0
+    fell_out = False
+    # 往下方最多探 1.5 格：掉下 64px 的台阶是允许的，只有真正的坑（通到
+    # 地图底部）才算"没有地面"。一开始只探 8px，结果电脑人把台阶边缘也
+    # 当成悬崖，从台阶上起跳正好飞进下一个坑里。
+    LEDGE = int(config.TILE * 1.5)
+
+    while frames < 1800:
+        # 简单自动驾驶：前方是墙、或前方地面断掉，就起跳
+        ahead_x = p.x + player.Player.WIDTH + 10
+        feet = p.y + player.Player.HEIGHT
+        on_wall = w.is_solid_px(ahead_x, feet - 12)
+        no_ground = w.ground_y_below(ahead_x, feet + 4,
+                                     limit=feet + LEDGE) is None
+        if p.on_ground and (on_wall or no_ground):
+            inp.jump_pressed = True
+        p.update(DT, inp, w.solids)
+        w.update(DT)
+        frames += 1
+        if p.y > w.bounds.bottom + 120:
+            fell_out = True
+            break
+        if p.rect.colliderect(w.goal_rect):
+            break
+
+    reached = p.rect.colliderect(w.goal_rect)
+    _check(u"从出生点走到终点", reached,
+           u"%d 帧（%.1f 秒）" % (frames, frames * DT))
+    _check(u"全程没有掉出地图", not fell_out,
+           u"最低 y=%.1f / 地图底 %d" % (p.y, w.bounds.bottom))
+    _check(u"时间在合理范围", 60 < frames < 1800,
+           u"%.1f 秒" % (frames * DT))
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -545,6 +773,10 @@ def run(app):
     test_anim_state()
     test_land_feel()
     test_physics()
+    test_level_parse()
+    test_level_errors()
+    test_camera()
+    test_level_playable()
 
     fails = len([r for r in RESULTS if not r[0]])
     print("")

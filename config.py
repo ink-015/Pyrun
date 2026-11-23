@@ -68,6 +68,17 @@ LAND_SINK_PX = 3.0
 #           content = 内容底边贴地（每帧强制脚落地，起伏被抹平）
 HERO_ANCHOR = "content"
 
+# ---------- 相机（M3 起使用） ----------
+# 指数平滑系数：每帧向目标靠拢 1-exp(-k*dt)，k 越大跟得越紧。
+# 7.0 时一帧收敛约 11%，跑起来镜头略微滞后于角色，不晕也不脱节。
+CAMERA_LERP = 7.0
+# 竖直死区：角色在画面中线上下这么多像素内移动时，镜头不动。
+# 没有它的话每次跳跃整个画面都会跟着上下弹，非常晕。
+CAMERA_DEADZONE_Y = 48.0
+
+# ---------- 关卡 ----------
+DEFAULT_LEVEL = os.path.join(LEVEL_DIR, "l1.txt")
+
 GLIDE_FALL_SPEED = 120.0
 GLIDE_RUN_SPEED = 330.0
 DASH_SPEED = 560.0
@@ -107,6 +118,8 @@ REQUIRED_FILES = [
     os.path.join(IMAGE_DIR, "hero", "standright.png"),
     os.path.join(IMAGE_DIR, "hero", "runright0.png"),
     os.path.join(IMAGE_DIR, "checkpoints", "campfire.png"),
+    # M3 起没有关卡文件就没什么可玩的，启动时直接报出来
+    DEFAULT_LEVEL,
 ]
 
 

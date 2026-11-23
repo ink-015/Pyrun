@@ -21,6 +21,7 @@ import assets
 import compat
 import config
 import player
+import world
 
 # ---------------------------------------------------------------- 字体
 
@@ -300,39 +301,73 @@ class MenuScene(Scene):
 # ---------------------------------------------------------------- 游戏场景
 
 class GameScene(Scene):
-    """M2：灰盒地形 + 玩家物理 + 调试显示。
+    """M3：关卡文件 + 相机跟随 + 基础 HUD。
 
-    M3 会把 _build_solids() 换成 levels/l1.txt 的解析结果；
-    在那之前这里的地形是硬编码的，只为验收物理。
+    地形、出生点、终点、金币全部来自 levels/*.txt，代码里不再硬编码任何
+    关卡数据。这样可以只改文本就调整关卡，也为 M6 多关卡铺好路。
     """
 
     name = "game"
-    GROUND_TOP = 460
 
     def __init__(self, app):
         Scene.__init__(self, app)
         self.player = None
-        self.solids = []
+        self.world = None
+        self.camera = None
         self.input = player.InputState()
         self.show_debug = True
         self._focused = True
-        self._bg = None
         self.sprites = None       # assets.HeroSprites；None 表示退回代码绘制
         self.sprite_error = ""
+        self.load_error = ""
+        self.goal_reached = False
+        self.level_time = 0.0
+        self.deaths = 0           # M4 接正式死亡流程前只在调试里显示
+        self._hud_bg = None
         # 非 None 时屏蔽键盘、直接采用这个轴值。
         # 无头截图和以后的录像回放都依赖它——否则 update() 每帧都会用
         # key.get_pressed() 覆盖外部写入的输入，自动化根本驱动不了角色。
         self.override_axis = None
 
+    # ---------------------------------------------------------------- 生命周期
     def on_enter(self):
-        self.solids = self._build_solids()
-        self.player = player.Player(80, self.GROUND_TOP - player.Player.HEIGHT)
         self.input = player.InputState()
         self.show_debug = True
         self._focused = True
-        self._bg = pygame.Surface((config.WIDTH, config.HEIGHT))
-        draw_paper(self._bg)
+        self.override_axis = None
+        self.load_level(config.DEFAULT_LEVEL)
         self._load_sprites()
+        self._build_hud()
+
+    def load_level(self, path):
+        """加载关卡。失败时把错误留在 self.load_error 里，画面显示出来。
+
+        关卡写错不该直接崩掉整个程序——玩家（或我自己）改图改错一个字符，
+        更希望看到「l1.txt:12:5 未知字符」而不是一个 traceback。
+        """
+        self.world = None
+        self.player = None
+        self.camera = None
+        self.goal_reached = False
+        self.level_time = 0.0
+        self.load_error = ""
+        try:
+            self.world = world.World.load(path)
+        except world.LevelError as exc:
+            self.load_error = str(exc)
+            print(u" 关卡加载失败：\n%s" % exc.describe())
+            return False
+        except Exception as exc:                      # 兜底，避免整程序退出
+            self.load_error = u"%s: %s" % (os.path.basename(path), exc)
+            print(u" 关卡加载失败：%s" % self.load_error)
+            return False
+
+        print(u" 关卡     : %s" % self.world.describe())
+        self.player = player.Player(*self.world.spawn)
+        self.camera = world.Camera((config.WIDTH, config.HEIGHT),
+                                   self.world.bounds)
+        self.camera.snap_to(self.player.rect)
+        return True
 
     def _load_sprites(self):
         """加载角色贴图。失败不抛，退回代码绘制——M1 定下的底线不能破。"""
@@ -346,25 +381,25 @@ class GameScene(Scene):
             self.sprite_error = str(exc)
             print(u" 角色贴图 : 缺失，退回代码绘制（%s）" % exc)
 
-    def on_exit(self):
-        self._bg = None
+    def _build_hud(self):
+        """HUD 底板只画一次。
 
-    def _build_solids(self):
-        """M2 验收用地形：地面 + 三个可跳上的平台 + 一堵堵路矮墙 + 高台。
-
-        矮墙高 80px，而跳跃高度约 126px，所以撞得到也跳得过——
-        既能验收"不能穿墙"，又不会把玩家困死。
+        compat.panel 内部是 2 倍超采样抗锯齿，实测 0.75ms/次，
+        每帧画两个就是 1.5ms——比整个地形渲染还贵。所以固化到一张图上。
         """
-        return [
-            pygame.Rect(0, self.GROUND_TOP, config.WIDTH, config.HEIGHT - self.GROUND_TOP),
-            pygame.Rect(170, 380, 140, 20),
-            pygame.Rect(380, 330, 140, 20),
-            pygame.Rect(600, 380, 140, 20),
-            pygame.Rect(760, 380, 26, 80),
-            pygame.Rect(850, 290, 100, 20),
-        ]
+        surf = pygame.Surface((config.WIDTH, config.HEIGHT), pygame.SRCALPHA)
+        left = pygame.Rect(16, 14, 240, 62)
+        compat.panel(surf, left, radius=14, fill=(255, 255, 255),
+                     border=config.COLOR_INK, width=2)
+        right = pygame.Rect(config.WIDTH - 156, 14, 140, 42)
+        compat.panel(surf, right, radius=14, fill=(255, 255, 255),
+                     border=config.COLOR_INK, width=2)
+        self._hud_bg = surf
 
-    # ---- 输入 ----
+    def on_exit(self):
+        pass
+
+    # ---------------------------------------------------------------- 输入
     def handle_event(self, event):
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
@@ -375,6 +410,11 @@ class GameScene(Scene):
                 self.input.jump_held = True
             elif event.key == pygame.K_F1:
                 self.show_debug = not self.show_debug
+            elif event.key == pygame.K_r:
+                # 重开本关：M7 会挂到正式 UI 上，现在先给个快捷键方便调试
+                self.on_enter()
+            elif event.key == pygame.K_RETURN and self.goal_reached:
+                self.on_enter()
         elif event.type == pygame.KEYUP:
             if event.key == pygame.K_SPACE:
                 self.input.jump_released = True
@@ -390,50 +430,92 @@ class GameScene(Scene):
         elif compat.focus_gained(event):
             self._focused = True
 
-    def update(self, dt):
+    def _poll_axis(self):
         if self.override_axis is not None:
             self.input.axis = self.override_axis
-        elif self._focused:
-            keys = pygame.key.get_pressed()
-            axis = 0.0
-            if keys[pygame.K_a] or keys[pygame.K_LEFT]:
-                axis -= 1.0
-            if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-                axis += 1.0
-            self.input.axis = axis
-        else:
+            return
+        if not self._focused:
             self.input.axis = 0.0
+            return
+        keys = pygame.key.get_pressed()
+        axis = 0.0
+        if keys[pygame.K_a] or keys[pygame.K_LEFT]:
+            axis -= 1.0
+        if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+            axis += 1.0
+        self.input.axis = axis
 
-        self.player.update(dt, self.input, self.solids)
+    # ---------------------------------------------------------------- 更新
+    def update(self, dt):
+        if self.world is None or self.player is None:
+            return
 
-        # 掉出画面先做最简处理，M4 才接正式死亡流程
-        if self.player.y > config.HEIGHT + 160:
-            self.player.reset()
+        self._poll_axis()
+        self.world.update(dt)
 
+        if self.goal_reached:
+            # 到终点后冻结角色，但仍让输入边沿自然衰减，避免重开时残留按键
+            self.input.release_edges()
+            return
+
+        self.level_time += dt
+        self.player.update(dt, self.input, self.world.solids)
+        self.world.collect(self.player.rect)
+        self.camera.update(dt, self.player.rect)
+
+        # 掉出地图：M3 先做最简回出生点，保证坑里不会无限下坠。
+        # M4 会换成统一的死亡流程（死亡计数、篝火重生、短暂无敌）。
+        if self.player.y > self.world.bounds.bottom + 120:
+            self.respawn()
+
+        if self.player.rect.colliderect(self.world.goal_rect):
+            self.goal_reached = True
+            self.input.release_edges()
+            print(u" 到达终点：%.1fs，金币 %d/%d" % (
+                self.level_time, self.world.taken_coins, self.world.total_coins))
+
+    def respawn(self):
+        self.player.reset()
+        if self.camera is not None:
+            self.camera.snap_to(self.player.rect)
+
+    # ---------------------------------------------------------------- 绘制
     def draw(self, surface):
-        surface.blit(self._bg, (0, 0))
-        self._draw_solids(surface)
+        surface.fill(config.COLOR_PAPER)
+
+        if self.world is None:
+            self._draw_load_error(surface)
+            return
+
+        self.world.draw(surface, self.camera)
         self._draw_player(surface)
+        self._draw_hud(surface)
 
         if self.show_debug:
             self._draw_debug(surface)
 
         f_hint, _ = get_font(16)
-        hint = u"← → / A D 移动     空格 跳跃     F1 调试     Esc 返回菜单"
+        hint = u"← → / A D 移动     空格 跳跃     R 重开     F1 调试     Esc 返回菜单"
+        w = f_hint.size(hint)[0]
         surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
-                     (24, config.HEIGHT - 28))
+                     ((config.WIDTH - w) // 2, config.HEIGHT - 26))
+
+        if self.goal_reached:
+            self._draw_goal_panel(surface)
 
     def _draw_player(self, surface):
         """画角色：优先贴图动画，素材缺失时退回代码火柴人。
 
         锚点约定（见 assets.HeroSprites 文档）：
           水平 画布中心 -> 碰撞盒中心
-          竖直 画布底边 -> 碰撞盒底边
+          竖直 内容底边 -> 碰撞盒底边
         再叠加落地瞬间的整体下沉，做出"踩实"的反馈。
+        世界坐标经 camera.offset 平移到屏幕坐标。
         """
         p = self.player
+        ox, oy = self.camera.offset
         if self.sprites is None:
-            draw_stick_figure(surface, p.rect.centerx, p.rect.bottom)
+            draw_stick_figure(surface, p.rect.centerx + ox, p.rect.bottom + oy)
             return
 
         count = self.sprites.frame_count(p.anim_state, p.facing)
@@ -442,21 +524,85 @@ class GameScene(Scene):
         x, y = self.sprites.blit_pos(p.rect.centerx,
                                      p.rect.bottom + int(round(p.land_sink)),
                                      p.anim_state, p.facing, idx)
-        surface.blit(img, (x, y))
+        surface.blit(img, (x + ox, y + oy))
 
-    def _draw_solids(self, surface):
-        for s in self.solids:
-            pygame.draw.rect(surface, config.COLOR_GROUND, s)
-            pygame.draw.rect(surface, config.COLOR_INK, s, 2)
+    def _level_title(self):
+        name = self.world.name if self.world else ""
+        if len(name) > 1 and name[0] == "l" and name[1:].isdigit():
+            return u"第 %d 关" % int(name[1:])
+        return name or u"关卡"
+
+    def _draw_hud(self, surface):
+        surface.blit(self._hud_bg, (0, 0))
+        f, _ = get_font(19, bold=True)
+        f_small, _ = get_font(15)
+        surface.blit(f.render(self._level_title(), True, config.COLOR_INK), (30, 22))
+        coins = u"金币 %d / %d" % (self.world.taken_coins, self.world.total_coins)
+        surface.blit(f_small.render(coins, True, config.COLOR_MUTED), (30, 48))
+
+        t = u"%05.1f s" % self.level_time
+        tw = f_small.size(t)[0]
+        surface.blit(f_small.render(t, True, config.COLOR_INK),
+                     (config.WIDTH - 30 - tw, 27))
+
+    def _draw_goal_panel(self, surface):
+        box = pygame.Rect(0, 0, 420, 190)
+        box.center = (config.WIDTH // 2, config.HEIGHT // 2 - 10)
+        veil = pygame.Surface((config.WIDTH, config.HEIGHT), pygame.SRCALPHA)
+        veil.fill((250, 247, 238, 190))
+        surface.blit(veil, (0, 0))
+        compat.panel(surface, box, radius=18, fill=(255, 255, 255),
+                     border=config.COLOR_INK, width=3)
+
+        f_big, _ = get_font(34, bold=True)
+        f, _ = get_font(18)
+        lines = [
+            (u"到达终点", f_big, config.COLOR_INK),
+            (u"用时 %.1f 秒    金币 %d / %d" % (self.level_time,
+                                              self.world.taken_coins,
+                                              self.world.total_coins),
+             f, config.COLOR_MUTED),
+            (u"Enter 重来    Esc 返回菜单", f, config.COLOR_MUTED),
+        ]
+        y = box.top + 26
+        for text, font_obj, color in lines:
+            img = font_obj.render(text, True, color)
+            surface.blit(img, (box.centerx - img.get_width() // 2, y))
+            y += img.get_height() + 16
+
+    def _draw_load_error(self, surface):
+        box = pygame.Rect(0, 0, 700, 260)
+        box.center = (config.WIDTH // 2, config.HEIGHT // 2)
+        compat.panel(surface, box, radius=18, fill=(255, 255, 255),
+                     border=config.COLOR_INK, width=3)
+
+        f_big, _ = get_font(26, bold=True)
+        f, _ = get_font(16)
+        surface.blit(f_big.render(u"关卡文件有问题", True, config.COLOR_INK),
+                     (box.left + 26, box.top + 20))
+        y = box.top + 66
+        for line in self.load_error.splitlines():
+            img = f.render(line, True, config.COLOR_MUTED)
+            surface.blit(img, (box.left + 26, y))
+            y += img.get_height() + 4
+        tip = f.render(u"Esc 返回菜单", True, config.COLOR_MUTED)
+        surface.blit(tip, (box.left + 26, box.bottom - 34))
 
     def _draw_debug(self, surface):
         f, _ = get_font(15)
         lines = self.player.debug_lines()
-        box = pygame.Rect(16, 14, 340, 16 + 20 * len(lines))
+        cam = self.camera
+        lines.append("cam  %.1f, %.1f  off %s"
+                     % (cam.x, cam.y, cam.offset))
+        box = pygame.Rect(16, 88, 380, 16 + 20 * len(lines))
         pygame.draw.rect(surface, (255, 255, 255), box)
         pygame.draw.rect(surface, config.COLOR_INK, box, 2)
         for i, line in enumerate(lines):
             surface.blit(f.render(line, True, config.COLOR_INK),
                          (box.left + 10, box.top + 8 + i * 20))
         # 碰撞盒线框：红色细线，用来核对视觉与判定是否一致
-        pygame.draw.rect(surface, (200, 60, 60), self.player.rect, 1)
+        pygame.draw.rect(surface, (200, 60, 60),
+                         self.camera.apply(self.player.rect), 1)
+        # 终点判定格：绿色细线，核对终点位置是否与旗子对齐
+        pygame.draw.rect(surface, (60, 150, 90),
+                         self.camera.apply(self.world.goal_rect), 1)

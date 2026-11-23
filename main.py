@@ -7,15 +7,17 @@
 M1 内容：固定步长主循环 + 场景管理 + 菜单/游戏两个场景。
 M2 内容：游戏场景接入玩家物理、灰盒地形与 F1 调试显示。
 M2.5 内容：角色贴图动画（assets.py），素材缺失时退回代码绘制。
+M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与终点结算。
 命令行开关：
     python main.py                 正常启动，进主菜单
     python main.py --smoke         渲染一帧菜单并截图，用于环境验证
-    python main.py --smoke-game    跳到游戏场景跑几步并截图
+    python main.py --smoke-game    跳到第一关跑几步并截图
+    python main.py --smoke-goal    跑到终点，截下结算面板
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
     python main.py --smoke-run     连续截取跑动帧拼成一条，判断动作连贯性
                                    （可选第二参数 canvas / content 对比锚点）
-    python main.py --selftest      运行分阶段自检（场景 + 贴图 + 动画 + 物理）
+    python main.py --selftest      运行分阶段自检（场景/贴图/动画/物理/关卡/相机）
     python main.py --bench 180 game   帧率基准，第二个参数可指定场景
     python main.py --fps           运行时在控制台打印实际帧率
 """
@@ -304,19 +306,41 @@ def main():
         return 0
 
     if "--smoke-game" in sys.argv:
-        # 跳到游戏场景：先落稳，再按住左跑一小段（左侧无遮挡），
-        # 确保画面里是跑动帧而不是站立帧
+        # 跳到游戏场景：先落稳，再按住右跑到第一处台阶前，
+        # 让画面里同时出现地面、台阶、金币和相机已经跟随的证据
         app.scenes.start("game")
         scene = app.scenes.current
         for _ in range(20):
             app.scenes.update(config.FIXED_DT)
-        scene.override_axis = -1.0
-        for _ in range(14):
+        scene.override_axis = 1.0
+        for _ in range(96):
             app.scenes.update(config.FIXED_DT)
         app.scenes.draw(screen)
         pygame.display.flip()
         print(u" 动画状态 : %s #%d" % (scene.player.anim_state, scene.player.anim_frame))
-        print(" 截图   :", save_screenshot(screen, "m2_game.png"))
+        print(u" 相机     : x=%.1f  offset=%s"
+              % (scene.camera.x, scene.camera.offset))
+        print(" 截图   :", save_screenshot(screen, "m3_game.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-goal" in sys.argv:
+        # 直接跑到终点并截下结算面板，作为「终点可达」的视觉证据
+        app.scenes.start("game")
+        scene = app.scenes.current
+        w = scene.world
+        scene.player.x = w.goal_rect.centerx - 120
+        scene.player.y = w.goal_rect.bottom - scene.player.HEIGHT
+        scene.camera.snap_to(scene.player.rect)
+        scene.override_axis = 1.0
+        for _ in range(40):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 终点     : reached=%s  用时 %.1fs  金币 %d/%d"
+              % (scene.goal_reached, scene.level_time,
+                 w.taken_coins, w.total_coins))
+        print(" 截图   :", save_screenshot(screen, "m3_goal.png"))
         pygame.quit()
         return 0
 
