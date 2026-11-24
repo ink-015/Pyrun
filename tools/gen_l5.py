@@ -12,6 +12,7 @@
 from __future__ import print_function
 
 import io
+import math
 import os
 import sys
 
@@ -33,9 +34,20 @@ GLIDE_FALL = 120.0
 GLIDE_SPEED = 330.0
 
 # 与 config.py 同步（这里不 import config，避免拉起 pygame 初始化）
+PLAYER_W = 26           # player.Player.WIDTH
 PLAYER_H = 70           # player.Player.HEIGHT
 ROTOR_ARM = 42.0        # config.ROTOR_ARM_LEN
 ROTOR_TIP = 8           # config.ROTOR_TIP_R
+PENDULUM_ARM = 148.0    # config.PENDULUM_ARM
+PENDULUM_AMP = 0.95     # config.PENDULUM_AMP
+PENDULUM_BOB_R = 16     # config.PENDULUM_BOB_R
+WALKER_RUN_MAX = 6      # config.WALKER_RUN_MAX
+WALKER_BODY_W = 40      # config.WALKER_BODY_W
+WALKER_SPEED = 62.0     # config.WALKER_SPEED
+# 巡逻一个来回超过这个时长，玩家就只能站着等，机关变成罚站。
+# 6 格（本关用的长度）算下来 11.1 秒，正好压在线上——再加一格就该改成
+# "让它在半路掉头"或者干脆换一只，而不是硬拉长。
+WALKER_CYCLE_MAX = 12.0
 
 
 def build():
@@ -78,11 +90,17 @@ def build():
     put(13, 10, "S")          # 告示牌 2：讲刀片（必须放在刺轮**左边**）
     put(16, 9, "X")
 
-    # ---- 低矮通道：必须踩怪才能过（跳不过去）----
+    # ---- 第二只走地怪：巡逻段一直伸到刺轮正下方 ----
+    # 这一段是本关的核心联动：刀片禁止起跳，走地怪又堵在同一条道上，
+    # 于是"跳过去"这条最顺手的解法被拿掉，只剩"等它走出来、在刀片外面踩"
+    # 或"贴着地跑过去再越过去"。6 格正好是 WALKER_RUN_MAX：再长一个来回
+    # 就要 12 秒，玩家只会站着等，那不叫机关，叫罚站。
+    for c in range(14, 20):
+        put(c, 10, "Z")
+
+    # ---- 低矮通道：天花板压到只剩两格高，跳不起来（纯节奏段）----
     for c in range(20, 28):
         solid(c, 8)           # 天花板
-    for c in (22, 23, 24):
-        put(c, 10, "Z")
 
     # ---- 荡锤：吊在横梁上 ----
     for c in range(29, 33):
@@ -101,8 +119,16 @@ def build():
     for r in range(0, 9):
         solid(65, r)
 
+    # ---- 篝火：本关最长，不加存档点的话死一次要从头再跑半张图 ----
+    # 第 27 列是低矮通道的出口，且在荡锤摆幅（扫到 1832~2072）之外；
+    # 第 55 列是高台的最后一格，跳坑之前。
+    put(27, 10, "C")
+    put(55, 8, "C")
+
     # ---- 金币 ----
-    for c, r in ((6, 10), (10, 9), (14, 10), (18, 10), (26, 10),
+    # 14 / 18 列原本是地面金币，现在正好落在走地怪的巡逻线上（会被怪踩过去），
+    # 挪到巡逻段两头：玩家要拿就得在那里起跳——那两处是刀片够不到的。
+    for c, r in ((6, 10), (10, 9), (12, 10), (19, 9), (26, 10),
                  (33, 10), (40, 8), (46, 8), (52, 8), (56, 8), (59, 8)):
         put(c, r, "c")
 
@@ -280,7 +306,6 @@ def check(grid, floor):
                     pass        # 浮在地面上方，正常
 
     # 11) 滑翔段：起跳点要有伞，缺口宽度要落在滑翔射程内
-    #     从地面起跳 -> 顶点约 127px -> 之后以 120px/s 下落
     jump_time = JUMP_V / (G_UP * HOLD)
     glide_time = JUMP_RISE / GLIDE_FALL
     reach = RUN_SPEED * jump_time + GLIDE_SPEED * glide_time
@@ -297,6 +322,83 @@ def check(grid, floor):
         problems.append(u"最宽缺口 %d 格（%dpx）超过滑翔射程 %.0fpx 的 80%%"
                         % (widest, widest * TILE, reach))
 
+    # 12) 篝火：脚下是地面，且**重生点**不在机关的扫掠范围内。
+    #     这一条不是形式主义：一开始我把篝火放在荡锤右边第 28 列，看着在
+    #     "锤子前面"，但摆幅扫到 1832~2072，重生点 1811 正好在圈里——
+    #     复活即被砸，比没有存档点更糟。
+    for r in range(H):
+        for c in range(W):
+            if grid[r][c] != "C":
+                continue
+            g = ground_row_of(c)
+            if g is None or g != r + 1:
+                problems.append(u"篝火 (%d,%d) 脚下不是紧贴地面，重生会掉下去"
+                                % (c + 1, r + 1))
+            spawn_cx = c * TILE + TILE // 2
+            for rr in range(H):
+                for cc in range(W):
+                    ch2 = grid[rr][cc]
+                    if ch2 == "X":
+                        reach_x = ROTOR_ARM + ROTOR_TIP + PLAYER_W
+                        if abs(spawn_cx - (cc * TILE + TILE // 2)) < reach_x:
+                            problems.append(
+                                u"篝火 (%d,%d) 在刺轮扫掠范围里：一重生就会被刀片打中"
+                                % (c + 1, r + 1))
+                    elif ch2 == "H":
+                        sweep = (PENDULUM_ARM * math.sin(PENDULUM_AMP)
+                                 + PENDULUM_BOB_R + PLAYER_W)
+                        if abs(spawn_cx - (cc * TILE + TILE // 2)) < sweep:
+                            problems.append(
+                                u"篝火 (%d,%d) 在荡锤摆幅内：一重生就会被砸"
+                                % (c + 1, r + 1))
+
+    # 13) 走地怪与刺轮的联动
+    #     刺轮是"禁跳区"——玩家在它下面本来就没有跳的需求，单放一个刀片
+    #     等于装饰。必须有走地怪把那条道占住，刀片才有意义：它掐掉的正是
+    #     "跳过去"这条最顺手的解法。
+    runs = []
+    for r in range(H):
+        c = 0
+        while c < W:
+            if grid[r][c] == "Z":
+                c0 = c
+                while c + 1 < W and grid[r][c + 1] == "Z":
+                    c += 1
+                runs.append((r, c0, c))
+            c += 1
+
+    for r in range(H):
+        for c in range(W):
+            if grid[r][c] != "X":
+                continue
+            cover = [x for x in runs if x[1] <= c <= x[2]]
+            if not cover:
+                problems.append(
+                    u"刺轮 (%d,%d) 下面没有走地怪：玩家在这儿本来就不需要跳，"
+                    u"机关等于摆设" % (c + 1, r + 1))
+                continue
+            r0, c0, c1 = cover[0]
+            reach_x = ROTOR_ARM + ROTOR_TIP + PLAYER_W
+            safe = [cc for cc in range(c0, c1 + 1)
+                    if abs((cc + 0.5) * TILE - (c + 0.5) * TILE) > reach_x]
+            if not safe:
+                problems.append(
+                    u"走地怪 %d-%d 列整段都在刺轮扫掠圈里：玩家没地方下脚踩它"
+                    % (c0 + 1, c1 + 1))
+
+    # 14) 巡逻段的长度与周期：太长就是"罚站"
+    for r0, c0, c1 in runs:
+        span = c1 - c0 + 1
+        if span > WALKER_RUN_MAX:
+            problems.append(u"走地怪 %d-%d 列合并了 %d 格，超过 %d 格上限"
+                            % (c0 + 1, c1 + 1, span, WALKER_RUN_MAX))
+        travel = span * TILE - WALKER_BODY_W
+        cycle = 2.0 * travel / WALKER_SPEED
+        if cycle > WALKER_CYCLE_MAX:
+            problems.append(
+                u"走地怪 %d-%d 列一个来回要 %.1f 秒，玩家只能站着等"
+                % (c0 + 1, c1 + 1, cycle))
+
     return problems, widest
 
 
@@ -306,7 +408,9 @@ SIGN_TEXT = [
     u"黑团子是走地怪：从头顶落下去能踩死它，撞到侧面会死。|"
     u"踩死之后它闪两下就没了——每只只死一次，别回头找它。",
     u"刀片吊在横梁下面，扫得很低。|"
-    u"贴着地横跑过去绝对安全——但只要起跳，脚一离地就会被绞进去。",
+    u"贴着地横跑过去绝对安全——但只要起跳，脚一离地就会被绞进去。|"
+    u"这条道上还有黑团子在转。别在刀口下面起跳：贴着地跑过去，"
+    u"到刀片够不着的地方再越过它。",
     u"荡锤看那条虚线：锤子摆到最外侧，就是你的窗口。",
 ]
 
@@ -315,7 +419,7 @@ def render(grid, floor):
     rows = to_rows(grid)
     out = []
     out.append(u"; 第 5 关：机关实验室（M7）")
-    out.append(u"; 走地怪 Z / 旋转刺轮 X / 荡锤 H / 空中滑翔伞 G")
+    out.append(u"; 走地怪 Z / 旋转刺轮 X / 荡锤 H / 空中滑翔伞 G / 篝火 C")
     out.append(u"; 生成器：tools/gen_l5.py（改这一关请改生成器，不要手改本文件）")
     out.append(u"")
     # 文本以"出现顺序"与地图里的 S 配对
@@ -358,8 +462,9 @@ def main():
             print(u"  - %s" % p)
         return 1
 
-    print(u"检查全部通过：矩形、图例、坑宽、台阶、走地怪落脚、刺轮位置、"
-          u"吊点、伞可达性、出生/终点、滑翔射程")
+    print(u"检查全部通过：矩形、图例、坑宽、台阶、走地怪落脚与巡逻周期、"
+          u"刺轮位置与下方巡逻联动、吊点、伞可达性、出生/终点、滑翔射程、"
+          u"篝火落脚与重生点安全性")
 
     path = os.path.join(ROOT, "levels", "l5.txt")
     if "--write" in sys.argv:

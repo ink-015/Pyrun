@@ -1898,6 +1898,32 @@ def test_m7_parse():
     _check(u"1 个刺轮", len(w.rotors) == 1, u"%d 个" % len(w.rotors))
     _check(u"1 个荡锤", len(w.hammers) == 1, u"%d 个" % len(w.hammers))
     _check(u"1 把伞", len(w.gliders) == 1, u"%d 把" % len(w.gliders))
+    _check(u"2 个篝火", len(w.checkpoints) == 2,
+           u"%d 个：%s" % (len(w.checkpoints),
+                          [c["col"] for c in w.checkpoints]))
+
+    # 刺轮是"禁跳区"，玩家在它下面本来就没有跳的需求；必须有一只走地怪
+    # 把这条道占住，刀片才有意义。
+    rot0 = w.rotors[0]
+    under = [wk for wk in w.walkers if wk.left <= rot0.cx <= wk.right]
+    _check(u"有一只走地怪在刺轮下面巡逻", bool(under),
+           u"%s" % [(round(wk.left), round(wk.right)) for wk in w.walkers])
+    if under:
+        wk = under[0]
+        reach_x = config.ROTOR_ARM_LEN + config.ROTOR_TIP_R + player.Player.WIDTH
+        room = max(rot0.cx - reach_x - wk.left, wk.right - (rot0.cx + reach_x))
+        _check(u"巡逻段有一头在刀片扫掠圈外（能安全起跳）", room >= 20.0,
+               u"最近的安全余量 %.0fpx" % room)
+
+    # 篝火的**重生点**不能在机关扫掠范围内：复活即被砸，比没有存档点更糟
+    ham0 = w.hammers[0]
+    sweep = (config.PENDULUM_ARM * math.sin(config.PENDULUM_AMP)
+             + config.PENDULUM_BOB_R + player.Player.WIDTH)
+    for cp in w.checkpoints:
+        _check(u"篝火 %d 列重生点不在荡锤摆幅内" % cp["col"],
+               abs(cp["spawn"][0] + player.Player.WIDTH * 0.5 - ham0.px)
+               > sweep, u"距离 %.0fpx / 摆幅 %.0fpx"
+               % (abs(cp["spawn"][0] + 13 - ham0.px), sweep))
 
     # 走地怪必须站在地上
     for wk in w.walkers:
@@ -1983,6 +2009,10 @@ def test_m7_scene(app):
            u"死亡 %d 次，原因「%s」" % (scene.deaths, scene.last_death_cause))
 
     # ---- 刺轮：贴地跑过是安全的，跳起来才挨 ----
+    # 这一段有只走地怪正好巡逻到刀片下面（M7.2 的设计）。这里测的是刀片
+    # 本身，所以先把怪收起来，测完再放回去。
+    saved_walkers = w.walkers
+    w.walkers = []
     scene.restart()
     rot = w.rotors[0]
     scene.player.teleport(rot.cx - 120 - W * 0.5, 11 * config.TILE - H)
@@ -2012,6 +2042,8 @@ def test_m7_scene(app):
            scene.deaths == 1 and u"刀片" in scene.last_death_cause,
            u"%d 帧（%.1fs）后死亡：「%s」"
            % (frames, frames * DT, scene.last_death_cause))
+
+    w.walkers = saved_walkers
 
     # ---- 荡锤砸死 ----
     scene.restart()
@@ -2113,6 +2145,50 @@ def test_m7_playable(app):
            % (frames, frames * DT, w.taken_coins, w.total_coins, scene.deaths))
 
 
+def test_m7_checkpoint(app):
+    _section(u"M7 第 5 关的篝火")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L5)
+    w = scene.world
+    if w is None:
+        _check(u"l5 可加载", False, scene.load_error)
+        return
+
+    cps = sorted(w.checkpoints, key=lambda c: c["col"])
+    _check(u"两处篝火分别在通道出口与水池前",
+           [c["col"] for c in cps] == [27, 55],
+           u"%s" % [c["col"] for c in cps])
+
+    # 荡锤前那个：点亮 → 在锤子下面送死 → 重生回篝火，而不是关底
+    cp = cps[0]
+    scene.player.teleport(cp["spawn"][0], cp["spawn"][1])
+    _run(scene, 2)
+    _check(u"碰到荡锤前的篝火会点亮", cp["active"], u"active=%s" % cp["active"])
+
+    ham = w.hammers[0]
+    scene.invuln = 0.0
+    scene.player.teleport(ham.px - player.Player.WIDTH * 0.5,
+                          11 * config.TILE - player.Player.HEIGHT)
+    frames = 0
+    while not scene.deaths and frames < 400:
+        scene.update(DT)
+        frames += 1
+    _check(u"站在锤子下面还是会死", scene.deaths == 1,
+           u"%d 帧，原因「%s」" % (frames, scene.last_death_cause))
+
+    _run(scene, int(config.DEATH_FREEZE / DT) + 3)
+    _check(u"死在荡锤下会回到篝火而不是从头跑",
+           abs(scene.player.x - cp["spawn"][0]) < 1.0,
+           u"x=%.0f，篝火 x=%d" % (scene.player.x, cp["spawn"][0]))
+
+    # 重生点必须在摆幅之外：否则复活即被砸，比没有存档点更糟
+    _run(scene, 90)
+    _check(u"站在篝火旁边不会被动到", scene.deaths == 1,
+           u"死亡 %d 次：「%s」" % (scene.deaths, scene.last_death_cause))
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -2145,6 +2221,7 @@ def run(app):
     test_pendulum()
     test_m7_parse()
     test_m7_scene(app)
+    test_m7_checkpoint(app)
     test_m7_air_glider(app)
     test_m7_playable(app)
     test_level_parse()

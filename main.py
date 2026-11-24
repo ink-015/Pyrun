@@ -559,28 +559,29 @@ def main():
               % (p.stomp_count, wk.state, p.vy))
         print(" 截图   :", save_screenshot(screen, "m7_stomp.png"))
 
-        # 2) 刺轮：站在危险范围外等，抓一条臂正对下方的帧（最有压迫感的一张）。
-        #    站在扫掠圈外而不是里面：无敌闪烁会让角色隔帧不画，截图里就没人了。
+        # 2) 刺轮 + 走地怪：这一张要同时拍到"头顶在转的刀片"和"刀片正下方
+        #    巡逻的黑团子"——它俩是一套机关：刀片禁跳，黑团子堵路，逼你先把
+        #    怪清掉再贴地跑过去。等角度而不是直接设，会拍到闪到空的那一帧，
+        #    所以这里跑几帧后把角度定死再画。
         scene.override_axis = 0.0
         rot = scene.world.rotors[0]
-        p.teleport(rot.cx - 104 - W * 0.5, 704 - H)
+        mate = scene.world.walkers[1] if len(scene.world.walkers) > 1 else None
+        p.teleport(rot.cx - 150 - W * 0.5, 704 - H)
         scene.invuln = 0.0
         scene.camera.snap_to(p.rect)
-        best = None
-        for _ in range(200):
+        scene.toast_text = ""          # 把上一张"踩掉了走地怪"的横幅清掉
+        scene.toast_timer = 0.0
+        if mate is not None:
+            mate.cx = rot.cx + 6
+            mate.dir = 1
+        for _ in range(20):
             app.scenes.update(config.FIXED_DT)
-            down = abs(((rot.angle % (2 * math.pi)) - math.pi / 2))
-            if down > math.pi:
-                down = 2 * math.pi - down
-            if best is None or down < best:
-                best = down
-                app.scenes.draw(screen)
-            if down < 0.06:
-                break
+        rot.angle = math.pi / 2
+        app.scenes.draw(screen)
         pygame.display.flip()
-        print(u" 刺轮     : 臂长 %.0f，周期 %.2fs，当前角 %.0f°"
+        print(u" 刺轮     : 臂长 %.0f，周期 %.2fs；刀片下方巡逻的黑团子 x=%.0f"
               % (config.ROTOR_ARM_LEN, 2 * math.pi / config.ROTOR_SPEED,
-                 math.degrees(rot.angle) % 360))
+                 mate.cx if mate is not None else -1))
         print(" 截图   :", save_screenshot(screen, "m7_rotor.png"))
 
         # 3) 荡锤：站在摆幅外侧（锤子扫不到的位置），画面里同时有梁、链、球
