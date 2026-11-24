@@ -13,6 +13,7 @@ M2.5 起游戏场景接入角色贴图动画，但保留 draw_stick_figure 作�
   SceneManager.register / start / goto
 """
 
+import math
 import os
 
 import pygame
@@ -338,6 +339,12 @@ class GameScene(Scene):
         self.last_death_cause = ""
         self.respawn_count = 0        # 自检用：真正发生了几次重生
 
+        # ---- 道具提示（M5）----
+        # 捡到伞的时候只弹一次提示，2.6 秒后自己消失。做成一闪而过的横幅，
+        # 而不是需要按键关掉的弹窗：捡道具不该打断跑动。
+        self.toast_text = ""
+        self.toast_timer = 0.0
+
     # ---------------------------------------------------------------- 生命周期
     def on_enter(self):
         self.input = player.InputState()
@@ -358,6 +365,8 @@ class GameScene(Scene):
         self.last_death_cause = ""
         self.respawn_count = 0
         self.level_time = 0.0
+        self.toast_text = ""
+        self.toast_timer = 0.0
 
     def load_level(self, path):
         """加载关卡。失败时把错误留在 self.load_error 里，画面显示出来。
@@ -424,8 +433,8 @@ class GameScene(Scene):
         每帧画两个就是 1.5ms——比整个地形渲染还贵。所以固化到一张图上。
         """
         surf = pygame.Surface((config.WIDTH, config.HEIGHT), pygame.SRCALPHA)
-        # 左面板留出三行：关卡名 / 金币 / 冲刺冷却条，所以比 M3 高一些
-        left = pygame.Rect(16, 14, 240, 86)
+        # 左面板留出四行：关卡名 / 金币与死亡 / 冲刺冷却条 / 道具栏（M5 加的）
+        left = pygame.Rect(16, 14, 240, 112)
         compat.panel(surf, left, radius=14, fill=(255, 255, 255),
                      border=config.COLOR_INK, width=2)
         right = pygame.Rect(config.WIDTH - 156, 14, 140, 42)
@@ -516,6 +525,8 @@ class GameScene(Scene):
         # 平台先动一步：玩家这一帧要撞的是平台的**新**位置，
         # 否则站在平台前沿时会被追尾，表现为每帧一次的小顿挫。
         self.world.update(dt)
+        if self.toast_timer > 0.0:
+            self.toast_timer = max(0.0, self.toast_timer - dt)
 
         # 死亡定格：角色不再受物理控制，也不再计时。
         # 不在这里 return 掉 world.update 是故意的——平台继续走，
@@ -594,12 +605,24 @@ class GameScene(Scene):
 
         self.world.collect(rect)
 
-        if rect.colliderect(self.world.goal_rect) and not self.goal_reached:
+        # 道具拾取：拿到伞只提示一次，重复踩同一格不会反复弹横幅。
+        for item in self.world.collect_items(rect):
+            if item == "glider" and p.pick_glider():
+                self.toast(u"获得滑翔伞：空中按住空格可以滑翔", 2.6)
+                print(u" 道具     : 获得滑翔伞（空中按住空格滑翔）")
+
+        if rect.colliderect(self.world.goal_zone) and not self.goal_reached:
             self.goal_reached = True
             self.input.release_edges()
             print(u" 到达终点：%.1fs，金币 %d/%d，死亡 %d 次" % (
                 self.level_time, self.world.taken_coins,
                 self.world.total_coins, self.deaths))
+
+    # ---------------------------------------------------------------- 提示
+    def toast(self, text, seconds=2.0):
+        """画面顶部弹一条短提示，自己消失。捡道具这类事件不该打断跑动。"""
+        self.toast_text = text
+        self.toast_timer = seconds
 
     # ---------------------------------------------------------------- 死亡与重生
     def die(self, cause=u"死亡"):
@@ -612,6 +635,9 @@ class GameScene(Scene):
         self.player.vx = 0.0
         self.player.vy = 0.0
         self.player.dash_time = 0.0
+        # 死亡定格期间 update 不再跑物理，gliding 不会自己归零，
+        # 不清掉的话死亡画面里伞还撑在头顶上。
+        self.player.gliding = False
         self.input.release_edges()
 
     def _respawn(self):
@@ -655,8 +681,13 @@ class GameScene(Scene):
         if self.show_debug and self.death_timer <= 0.0:
             self._draw_debug(surface)
 
+        # 提示条放在调试面板之后：它只在捡到道具那 2 秒出现，
+        # 被压在面板下面就等于没提示。
+        if self.toast_timer > 0.0 and self.toast_text:
+            self._draw_toast(surface)
+
         f_hint, _ = get_font(16)
-        hint = (u"← → / A D 移动   空格 跳跃   Shift 冲刺   "
+        hint = (u"← → / A D 移动   空格 跳跃（空中按住 滑翔）   Shift 冲刺   "
                 u"T 回检查点   R 重开   N 切关   F1 调试   Esc 菜单")
         w = f_hint.size(hint)[0]
         surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
@@ -685,6 +716,8 @@ class GameScene(Scene):
             return
         if self.sprites is None:
             draw_stick_figure(surface, p.rect.centerx + ox, p.rect.bottom + oy)
+            if p.gliding:
+                self._draw_glider(surface, ox, oy)
             return
 
         count = self.sprites.frame_count(p.anim_state, p.facing)
@@ -694,6 +727,30 @@ class GameScene(Scene):
                                      p.rect.bottom + int(round(p.land_sink)),
                                      p.anim_state, p.facing, idx)
         surface.blit(img, (x + ox, y + oy))
+        if p.gliding:
+            self._draw_glider(surface, ox, oy)
+
+    def _draw_glider(self, surface, ox, oy):
+        """滑翔中在头顶画伞：伞面 + 两条缰绳 + 一点左右摆动。
+
+        为什么挂在头顶而不是手里：火柴人没有"抓握"的姿势能让玩家看清，
+        伞在头顶上方才能一眼看出"这东西正在兜住我"。
+
+        伞面用 world.draw_canopy：和地上的道具图标共用同一段绘制，
+        这样"地上捡的东西"和"身上撑开的伞"形状一致，不需要解释。
+        """
+        p = self.player
+        cx = p.rect.centerx + ox
+        top = p.rect.top + oy
+        sway = 3.0 * math.sin(self.world.time * 3.4)
+        pts = world.draw_canopy(surface, cx, top - config.GLIDE_CANOPY_LIFT,
+                                half_w=31, height=20, sway=sway)
+        base_y = pts[0][1]
+        # 缰绳：从伞面两端收到肩膀外侧。画 2px 而不是 1px——1px 在纸底上
+        # 几乎看不见，伞就成了"浮在头上的帽子"。
+        for sx, ex in ((pts[0][0], cx - 10), (pts[-1][0], cx + 10)):
+            pygame.draw.line(surface, config.COLOR_INK,
+                             (sx, base_y), (ex, top + 18), 2)
 
     def _draw_dash_trail(self, surface, ox, oy):
         """冲刺残影：身后拖三条墨线。
@@ -740,6 +797,38 @@ class GameScene(Scene):
                      (config.WIDTH - 30 - tw, 27))
 
         self._draw_dash_meter(surface)
+        self._draw_item_slot(surface)
+
+    def _draw_item_slot(self, surface):
+        """HUD 第四行：道具栏。
+
+        没拿到伞时画一个浅色空位，而不是干脆不画——"这里以后会放东西"
+        本身就是引导，玩家会顺着去关卡里找。拿到后填成实心伞；滑翔中
+        换成篝火橙，让"伞正在起作用"有个即时反馈。
+        """
+        p = self.player
+        f, _ = get_font(14)
+        cx, cy = 42, 100
+        if p.has_glider:
+            color = config.COLOR_CAMP if p.gliding else config.COLOR_GLIDE
+            pts = world.draw_canopy(surface, cx, cy - 3, half_w=11, height=9,
+                                    fill=color)
+            pygame.draw.line(surface, config.COLOR_INK, pts[0], (cx, cy + 5), 1)
+            pygame.draw.line(surface, config.COLOR_INK, pts[-1], (cx, cy + 5), 1)
+        else:
+            world.draw_canopy(surface, cx, cy - 3, half_w=11, height=9,
+                              fill=(232, 229, 220), outline=(190, 186, 176))
+
+        surface.blit(f.render(u"滑翔伞", True,
+                              config.COLOR_INK if p.has_glider
+                              else config.COLOR_MUTED), (60, 88))
+        if p.gliding:
+            tip, color = u"滑翔中", config.COLOR_CAMP
+        elif p.has_glider:
+            tip, color = u"空中按住空格", config.COLOR_MUTED
+        else:
+            tip, color = u"未获得", config.COLOR_MUTED
+        surface.blit(f.render(tip, True, color), (112, 88))
 
     def _draw_dash_meter(self, surface):
         """HUD 第三行：冲刺冷却条。
@@ -761,6 +850,27 @@ class GameScene(Scene):
                              pygame.Rect(bar.left + 1, bar.top + 1,
                                          fill, bar.height - 2))
         pygame.draw.rect(surface, config.COLOR_INK, bar, 1)
+
+    def _draw_toast(self, surface):
+        """页面顶部的短提示条。
+
+        不做淡出：文字透明要先 render 到带 alpha 的面上再 blit，多一次
+        全屏混合；改成"最后 0.6 秒变成一条细线"，视觉上同样是"要消失了"。
+        """
+        f, _ = get_font(17, bold=True)
+        img = f.render(self.toast_text, True, config.COLOR_INK)
+        box = pygame.Rect(0, 0, img.get_width() + 44, 36)
+        box.centerx = config.WIDTH // 2
+        box.top = 132
+        if self.toast_timer < 0.6:
+            box = pygame.Rect(box.left, box.centery - 2, box.width, 4)
+        else:
+            compat.rounded_rect(surface, (255, 255, 255), box, radius=10)
+            compat.rounded_rect(surface, config.COLOR_GLIDE, box, radius=10, width=2)
+            surface.blit(img, (box.centerx - img.get_width() // 2,
+                               box.centery - img.get_height() // 2))
+            return
+        pygame.draw.rect(surface, config.COLOR_GLIDE, box)
 
     def _draw_death_panel(self, surface):
         """死亡定格画面。
@@ -852,7 +962,7 @@ class GameScene(Scene):
                      % (self.deaths, self.invuln,
                         "-" if self.checkpoint is None
                         else "%d" % (self.checkpoint_index + 1)))
-        box = pygame.Rect(16, 112, 380, 16 + 20 * len(lines))
+        box = pygame.Rect(16, 176, 380, 16 + 20 * len(lines))
         pygame.draw.rect(surface, (255, 255, 255), box)
         pygame.draw.rect(surface, config.COLOR_INK, box, 2)
         for i, line in enumerate(lines):

@@ -16,6 +16,7 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-goal    跑到终点，截下结算面板
     python main.py --smoke-m4      在机关关 l2 截一张（篝火/地刺/单向平台/移动平台）
     python main.py --smoke-death   触发一次落水死亡，截下死亡定格画面
+    python main.py --smoke-glide   第 3 关：先走过去捡伞，再抓一张滑翔中的画面
     python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -421,6 +422,40 @@ def main():
         print(u" 死亡     : %d 次，原因「%s」，定格 %.2fs"
               % (scene.deaths, scene.last_death_cause, scene.death_timer))
         print(" 截图   :", save_screenshot(screen, "m4_death.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-glide" in sys.argv:
+        # M5 滑翔伞：先真的走过去捡伞（顺带截下提示条与 HUD），
+        # 再从起跳台跑出去按住空格，抓一张飘在水坑上方的画面
+        app.level_path = os.path.join(config.LEVEL_DIR, "l3.txt")
+        app.scenes.start("game")
+        scene = app.scenes.current
+        p = scene.player
+        scene.show_debug = False        # 截图要看的是玩家看到的样子，不是调试面板
+
+        scene.override_axis = 1.0
+        for _ in range(26):
+            app.scenes.update(config.FIXED_DT)
+        scene.override_axis = None
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 拾取     : 伞=%s  x=%.0f  提示「%s」"
+              % (p.has_glider, p.x, scene.toast_text))
+        print(" 截图   :", save_screenshot(screen, "m5_item.png"))
+
+        p.teleport(19 * config.TILE, 6 * config.TILE - p.HEIGHT)
+        scene.camera.snap_to(p.rect)
+        scene.override_axis = 1.0
+        scene.input.jump_held = True      # 只按住，不按边沿：走出去自然进入滑翔
+        # 100 帧：此时正好飘到水坑中段，水面也在视野里，看得出"下面是死路"
+        for _ in range(100):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 滑翔     : %s  vy=%.0f  vx=%.0f  x=%.0f（水坑 21~28 列）"
+              % (p.gliding, p.vy, p.vx, p.x))
+        print(" 截图   :", save_screenshot(screen, "m5_glide.png"))
         pygame.quit()
         return 0
 

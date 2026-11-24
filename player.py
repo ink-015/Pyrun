@@ -85,6 +85,13 @@ class Player(object):
         self.bounce_cd = 0.0
         self.bounce_count = 0
 
+        # ---- 道具：滑翔伞（M5）----
+        # has_glider 是"这一关拿没拿到"，不是角色属性：重开本关要重新去捡，
+        # 但死亡重生不该丢——否则每次掉坑都要跑回去捡伞。
+        self.has_glider = False
+        self.gliding = False
+        self.glide_frames = 0       # 累计滑翔帧数，调试面板与自检用
+
         # ---- 动画状态（纯逻辑，不持有任何 Surface）----
         self.anim_state = "idle"    # idle / run / jump
         self.anim_frame = 0
@@ -138,6 +145,17 @@ class Player(object):
                 self._start_dash(inp.axis)
         dashing = self.dash_time > 0.0
 
+        # 4.5 滑翔（README §18.5）：有伞、在空中、正在下落、按住跳跃键。
+        #     判定必须放在水平积分之前——水平目标 330 与下落上限 120 都要从
+        #     这一帧起生效；放到重力之后再判，第一帧仍按跑速和正常重力算，
+        #     表现为"按住空格后伞晚一帧才张开"。
+        #     条件里带 vy > 0，所以"重新上升就退出滑翔"是自带的，不用另写。
+        self.gliding = (self.has_glider and not dashing
+                        and not self.on_ground and self.vy > 0.0
+                        and inp.jump_held)
+        if self.gliding:
+            self.glide_frames += 1
+
         # 5. 水平速度：冲刺期间接管，否则正常加速 / 减速
         if dashing:
             self.dash_time = max(0.0, self.dash_time - dt)
@@ -145,6 +163,16 @@ class Player(object):
             # 冻结竖直速度：地面冲刺贴地直冲，空中冲刺走直线不会往下沉
             self.vy = 0.0
             self.jumping = False
+        elif self.gliding:
+            # 滑翔时的水平控制：按住方向就加速到 330，松开则缓慢衰减。
+            # 衰减得慢（240px/s²）是有意的——"飘"意味着松手还在往前滑，
+            # 用空中加速度 1500 会让人松手后 0.2 秒就停住，像踩了刹车。
+            if inp.axis != 0.0:
+                self.facing = 1 if inp.axis > 0 else -1
+                self.vx = _approach(self.vx, inp.axis * config.GLIDE_RUN_SPEED,
+                                    config.AIR_ACCEL * dt)
+            else:
+                self.vx = _approach(self.vx, 0.0, config.GLIDE_DECEL * dt)
         elif inp.axis != 0.0:
             self.facing = 1 if inp.axis > 0 else -1
             accel = config.GROUND_ACCEL if self.on_ground else config.AIR_ACCEL
@@ -185,9 +213,18 @@ class Player(object):
                 g = config.GRAVITY_UP
                 if inp.jump_held and self.jumping:
                     g *= config.JUMP_HOLD_GRAVITY_SCALE
+            elif self.gliding:
+                # 滑翔时把重力压到两成，再把速度钳到上限。
+                # 只钳不压的话，速度每帧被重力推到 120 又被钳回来，人走的是
+                # 一条"锯齿线"；压重力之后是平滑地爬到 120，看着才像在飘。
+                g = config.GRAVITY_DOWN * 0.2
             else:
                 g = config.GRAVITY_DOWN
             self.vy = min(self.vy + g * dt, config.MAX_FALL_SPEED)
+            if self.gliding:
+                # 上限钳制另算：从高处掉下来再按空格时，vy 可能已经是 800，
+                # 这一下要立刻收到 120，而不是慢慢减——伞张开的瞬间就是刹车。
+                self.vy = min(self.vy, config.GLIDE_FALL_SPEED)
 
         # 10. 垂直移动与碰撞
         self._move_vertical(self.vy * dt, solids, oneways, bouncers)
@@ -243,6 +280,14 @@ class Player(object):
     def can_dash(self):
         return self.dash_cd <= 0.0 and self.dash_time <= 0.0
 
+    # ---------------------------------------------------------------- 道具
+    def pick_glider(self):
+        """拿到滑翔伞。已经有了就返回 False——提示只该弹一次。"""
+        if self.has_glider:
+            return False
+        self.has_glider = True
+        return True
+
     # ---------------------------------------------------------------- 机关与重生
     def bounce(self, speed=None):
         """被弹跳板顶起。返回是否真的弹了（冷却中返回 False）。"""
@@ -294,6 +339,7 @@ class Player(object):
         self.jump_buffer = 0.0
         self.jumping = False
         self.dash_time = 0.0
+        self.gliding = False
         self.land_timer = 0.0
         self.anim_state = "idle"
         self.anim_frame = 0
@@ -566,6 +612,9 @@ class Player(object):
             "dash  %s  cd %.2f  n=%d"
             % ("ON" if self.dashing else "  ", self.dash_cd, self.dash_count),
             "bounce %d  cd %.2f" % (self.bounce_count, self.bounce_cd),
+            "glide %s  %s  %d 帧"
+            % ("ON " if self.gliding else "off",
+               "有伞" if self.has_glider else "无伞", self.glide_frames),
             "anim %s #%d  phase %.2f"
             % (self.anim_state, self.anim_frame, self.anim_phase),
         ]

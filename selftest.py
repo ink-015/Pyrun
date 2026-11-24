@@ -1175,16 +1175,224 @@ def test_level_playable():
         if p.y > w.bounds.bottom + 120:
             fell_out = True
             break
-        if p.rect.colliderect(w.goal_rect):
+        if p.rect.colliderect(w.goal_zone):
             break
 
-    reached = p.rect.colliderect(w.goal_rect)
+    reached = p.rect.colliderect(w.goal_zone)
     _check(u"从出生点走到终点", reached,
            u"%d 帧（%.1f 秒）" % (frames, frames * DT))
     _check(u"全程没有掉出地图", not fell_out,
            u"最低 y=%.1f / 地图底 %d" % (p.y, w.bounds.bottom))
     _check(u"时间在合理范围", 60 < frames < 1800,
            u"%.1f 秒" % (frames * DT))
+
+
+# ---------------------------------------------------------------- M5 道具
+L3 = os.path.join(config.LEVEL_DIR, "l3.txt")
+
+
+def test_glide():
+    _section(u"M5 滑翔伞")
+
+    solids = _flat()                       # 地面顶面 460
+
+    # 1) 没拿到伞：空中按住空格也只是普通下落
+    p = player.Player(100, 200)
+    inp = player.InputState()
+    inp.jump_held = True
+    for _ in range(10):
+        p.update(DT, inp, solids)
+    _check(u"没伞不会滑翔",
+           (not p.gliding) and p.glide_frames == 0
+           and p.vy > config.GLIDE_FALL_SPEED,
+           u"gliding=%s vy=%.0f" % (p.gliding, p.vy))
+
+    # 2) 有伞：按住空格，下落被压到 120，水平给到 330
+    p2 = player.Player(100, 200)
+    p2.pick_glider()
+    held = player.InputState()
+    held.jump_held = True
+    held.axis = 1.0
+    for _ in range(30):
+        p2.update(DT, held, solids)
+    # 第 1 帧 vy 还是 0，不满足"正在下落"，所以实到 29 帧才开始滑翔
+    _check(u"有伞按住空格进入滑翔", p2.gliding and p2.glide_frames >= 29,
+           u"滑翔 %d 帧" % p2.glide_frames)
+    _check(u"下落速度被压到 120", abs(p2.vy - config.GLIDE_FALL_SPEED) < 0.5,
+           u"vy=%.1f" % p2.vy)
+    _check(u"水平速度给到 330", abs(p2.vx - config.GLIDE_RUN_SPEED) < 0.5,
+           u"vx=%.1f" % p2.vx)
+
+    # 同样 30 帧，不滑翔要掉 130px 以上
+    ref = player.Player(100, 200)
+    ref_inp = player.InputState()
+    for _ in range(30):
+        ref.update(DT, ref_inp, solids)
+    _check(u"滑翔比自由落体慢得多", (p2.y - 200.0) < (ref.y - 200.0) * 0.5,
+           u"滑翔 %.1f px / 自由落体 %.1f px" % (p2.y - 200.0, ref.y - 200.0))
+
+    # 3) 松开按键立刻退出滑翔
+    held.jump_held = False
+    p2.update(DT, held, solids)
+    vy_after = p2.vy
+    for _ in range(6):
+        p2.update(DT, held, solids)
+    _check(u"松开空格退出滑翔", (not p2.gliding) and p2.vy > vy_after,
+           u"vy %.0f -> %.0f" % (vy_after, p2.vy))
+
+    # 4) 上升阶段不滑翔：起跳瞬间就按住也不行
+    p3 = player.Player(100, 460 - player.Player.HEIGHT)
+    p3.pick_glider()
+    up = player.InputState()
+    up.jump_pressed = True
+    up.jump_held = True
+    climbed = False
+    for _ in range(20):
+        p3.update(DT, up, solids)
+        if p3.vy < 0.0:
+            climbed = True
+            if p3.gliding:
+                climbed = False
+                break
+    _check(u"上升阶段不进入滑翔", climbed and (not p3.gliding),
+           u"vy=%.0f gliding=%s" % (p3.vy, p3.gliding))
+
+    # 5) 滑翔不能穿过墙
+    wall = pygame.Rect(300, 120, 40, 400)
+    p4 = player.Player(100, 200)
+    p4.pick_glider()
+    glide_in = player.InputState()
+    glide_in.jump_held = True
+    glide_in.axis = 1.0
+    for _ in range(120):
+        p4.update(DT, glide_in, solids + [wall])
+    _check(u"滑翔撞墙会停住", p4.x + player.Player.WIDTH <= wall.left + 0.5,
+           u"x=%.1f（墙左沿 %d）" % (p4.x, wall.left))
+
+
+def test_m5_scene(app):
+    _section(u"M5 关卡：拾取 / 重生保留 / 滑翔过坑")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L3)
+    w = scene.world
+    if w is None:
+        _check(u"l3 可加载", False, scene.load_error)
+        return
+
+    _check(u"l3 尺寸 54x13", (w.width_tiles, w.height_tiles) == (54, 13),
+           u"%d x %d" % (w.width_tiles, w.height_tiles))
+    _check(u"l3 有 1 把滑翔伞", len(w.gliders) == 1, u"%d 把" % len(w.gliders))
+
+    # ---- 拾取 ----
+    it = w.gliders[0]
+    scene.player.teleport(it["pos"][0] - player.Player.WIDTH // 2,
+                          it["pos"][1] - player.Player.HEIGHT // 2)
+    _run(scene, 1)
+    _check(u"碰到道具拿到滑翔伞",
+           scene.player.has_glider and w.glider_taken == 1,
+           u"has_glider=%s taken=%d" % (scene.player.has_glider, w.glider_taken))
+    _check(u"拾取后弹出提示", scene.toast_timer > 0.0, scene.toast_text)
+
+    # 重复踩同一格不该再提示
+    scene.toast_text = ""
+    scene.player.has_glider = False          # 强行让拾取判定再走一遍
+    _run(scene, 1)
+    _check(u"道具不会重复提示", scene.toast_text == "",
+           u"提示「%s」" % scene.toast_text)
+    scene.player.has_glider = True
+
+    # ---- 从道具上方跳过去也要算捡到 ----
+    # 判定区是 3 格高的竖条就是为了防这个：滑翔伞是通关必需道具，
+    # 不能因为"跑的时候顺手跳了一下"就漏掉，然后在坑边才发现过不去。
+    scene.restart()
+    p0 = scene.player
+    p0.teleport(it["pos"][0] - 60, 640 - player.Player.HEIGHT)
+    _run(scene, 2)
+    scene.input.jump_pressed = True
+    scene.input.jump_held = True
+    scene.override_axis = 1.0
+    _run(scene, 20)
+    scene.override_axis = None
+    jumped = not p0.on_ground
+    scene.input.jump_held = False
+    scene.input.jump_pressed = False
+    _check(u"跳着经过也能捡到伞",
+           jumped and scene.player.has_glider,
+           u"空中=%s has_glider=%s y=%.0f"
+           % (jumped, scene.player.has_glider, scene.player.y))
+
+    # ---- 死亡重生保留道具 ----
+    # 这里显式给一次伞，让这条断言只依赖"重生是否保留"，
+    # 不依赖上面那条跳着捡伞的用例是否通过
+    scene.player.has_glider = True
+    water = [b for b, ch in w.hazard_boxes if ch == "~"][0]
+    scene.player.teleport(water.centerx, water.top)
+    _run(scene, 1)
+    _check(u"落水会死", scene.deaths == 1, u"死亡 %d 次" % scene.deaths)
+    _run(scene, int(config.DEATH_FREEZE / DT) + 2)
+    _check(u"重生后仍然带着伞", scene.player.has_glider,
+           u"has_glider=%s" % scene.player.has_glider)
+
+    # ---- R 重开：道具回到"没捡"状态 ----
+    scene.restart()
+    _check(u"重开清空道具", (not scene.player.has_glider)
+           and w.glider_taken == 0 and (not w.gliders[0]["taken"]),
+           u"has_glider=%s taken=%d" % (scene.player.has_glider, w.glider_taken))
+
+    # ---- 大坑：有伞过得去 ----
+    def cross(with_glider):
+        scene.restart()
+        p = scene.player
+        p.has_glider = with_glider
+        p.teleport(19 * config.TILE, 6 * config.TILE - p.HEIGHT)
+        scene.camera.snap_to(p.rect)
+        scene.override_axis = 1.0
+        scene.input.jump_held = with_glider
+        airborne = False
+        for f in range(300):
+            scene.update(DT)
+            if scene.deaths:
+                break
+            if not p.on_ground:
+                airborne = True
+            elif airborne:
+                break
+        scene.override_axis = None
+        scene.input.jump_held = False
+        return p, f
+
+    p, frames = cross(True)
+    _check(u"l3 大坑靠滑翔能过",
+           scene.deaths == 0 and p.on_ground and p.x > 29 * config.TILE,
+           u"落点 x=%.0f（对岸 1856），%d 帧，死亡 %d"
+           % (p.x, frames, scene.deaths))
+
+    p, frames = cross(False)
+    _check(u"不按空格过不去这个坑", scene.deaths >= 1,
+           u"x=%.0f 死亡 %d" % (p.x, scene.deaths))
+
+    # ---- 整关可通关 ----
+    # 用"一路蹦着跑"这种最粗糙的跑法收尾：它最容易从旗子头顶飞过去，
+    # 也最容易在平台上跳歪。能用它通关，说明关卡没有藏死的判定。
+    scene.restart()
+    scene.override_axis = 1.0
+    frames = 0
+    for f in range(2400):
+        if scene.player.on_ground:
+            scene.input.jump_pressed = True
+        scene.input.jump_held = True
+        scene.update(DT)
+        frames = f
+        if scene.goal_reached:
+            break
+    scene.override_axis = None
+    scene.input.jump_held = False
+    _check(u"l3 从出生点跑到终点", scene.goal_reached,
+           u"%d 帧（%.1f 秒），金币 %d/%d，死亡 %d"
+           % (frames, frames * DT, scene.world.taken_coins,
+              scene.world.total_coins, scene.deaths))
 
 
 # ---------------------------------------------------------------- 入口
@@ -1205,6 +1413,8 @@ def run(app):
     test_platform()
     test_platform_squeeze()
     test_m4_scene(app)
+    test_glide()
+    test_m5_scene(app)
     test_level_parse()
     test_level_errors()
     test_camera()

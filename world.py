@@ -32,6 +32,7 @@ TILE_GOAL = "F"
 TILE_COIN = "c"
 TILE_BOUNCE = "J"
 TILE_CHECK = "C"
+TILE_GLIDER = "G"
 
 LEGEND = {
     ".": u"空气",
@@ -113,6 +114,7 @@ class _Parsed(object):
         self.oneways = []         # [(col, row)]
         self.checkpoints = []     # [(col, row)]
         self.bouncers = []        # [(col, row)]
+        self.gliders = []         # [(col, row)]  M5 道具
         self.platforms = []       # [(col, row, ch)]  同字符连续段稍后合并
         self.others = []          # [(col, row, ch)]  已识别但暂未实现
 
@@ -165,6 +167,8 @@ def _parse(path):
                 out.checkpoints.append((col, row))
             elif ch == TILE_BOUNCE:
                 out.bouncers.append((col, row))
+            elif ch == TILE_GLIDER:
+                out.gliders.append((col, row))
             elif ch in ("M", "m"):
                 out.platforms.append((col, row, ch))
             elif ch in HAZARD_CHARS:
@@ -322,6 +326,30 @@ def _platform_runs(cells):
     return out
 
 
+# ---------------------------------------------------------------- 伞面
+
+def draw_canopy(surface, cx, base_y, half_w=20, height=16,
+                fill=None, outline=None, sway=0.0):
+    """画一片伞面（上半圆弧），道具图标与角色头顶的滑翔伞共用。
+
+    为什么不用 pygame.draw.arc：它只能描边，画不出"实心弧面"；用椭圆上半圈
+    的多边形拟合，既能填色又能描边，顶点数与 draw.arc 一致，看不出区别。
+    ``sway`` 让伞面整体左右歪一点，滑翔时伞会轻轻摆，静止图标则不歪。
+    """
+    fill = config.COLOR_GLIDE if fill is None else fill
+    outline = config.COLOR_INK if outline is None else outline
+    steps = 10
+    pts = []
+    for i in range(steps + 1):
+        a = math.pi * i / steps
+        pts.append((int(round(cx + half_w * math.cos(a) + sway * math.sin(a))),
+                    int(round(base_y - height * math.sin(a)))))
+    pygame.draw.polygon(surface, fill, pts)
+    pygame.draw.lines(surface, outline, False, pts, 2)
+    pygame.draw.line(surface, outline, pts[0], pts[-1], 2)
+    return pts
+
+
 # ---------------------------------------------------------------- 相机
 
 class Camera(object):
@@ -443,6 +471,12 @@ class World(object):
         self.goal_cells = list(parsed.goal)
         gc, gr = parsed.goal[0]
         self.goal_rect = pygame.Rect(gc * tile, gr * tile, tile, tile)
+        # 终点判定区比旗子那一格高：旗子是一根杆，从杆的任意高度经过都算到。
+        # 只看脚下那一格的话，一路蹦着过去的玩家会从旗子头顶飞过去，
+        # 然后在关底外面掉出地图——这不是"技术好"，是判定不合理。
+        self.goal_zone = pygame.Rect(gc * tile,
+                                     (gr + 1 - config.GOAL_ZONE_ROWS) * tile,
+                                     tile, config.GOAL_ZONE_ROWS * tile)
         self.goal_reached = False
 
         # 金币：格子中心 24x24 的拾取框，比贴图小，避免"擦边就算吃到"
@@ -496,6 +530,25 @@ class World(object):
                 "phase": (c * 0.37) % 6.28,
             })
 
+        # ---- 道具：滑翔伞（M5）----
+        # 判定区是整格宽、往上 3 格高的竖条（见 config.ITEM_CATCH_ROWS）：
+        # 玩家从道具上方跳过去也算拿到。滑翔伞是通关必需道具，不能因为
+        # "跑的时候顺手跳了一下"就漏捡，然后在坑边才发现自己过不去。
+        rows = config.ITEM_CATCH_ROWS
+        self.gliders = []
+        for c, r in parsed.gliders:
+            self.gliders.append({
+                "col": c, "row": r,
+                "rect": pygame.Rect(c * tile, (r + 1 - rows) * tile,
+                                    tile, rows * tile),
+                # 画图仍然按格子中心，判定区比图标大得多
+                "pos": (c * tile + tile // 2, r * tile + tile // 2),
+                "taken": False,
+                "phase": (c * 0.9) % 6.28,
+            })
+        self.glider_total = len(self.gliders)
+        self.glider_taken = 0
+
         self.time = 0.0
         self.flag_img = None
         self.coin_img = None
@@ -503,7 +556,6 @@ class World(object):
         self.camp_dim_img = None
         self._load_images()
         self.bg = self._bake()
-
     # ---- 加载 ----
     @classmethod
     def load(cls, path):
@@ -619,6 +671,9 @@ class World(object):
         for coin in self.coins:
             coin["taken"] = False
         self.taken_coins = 0
+        for it in self.gliders:
+            it["taken"] = False
+        self.glider_taken = 0
         for cp in self.checkpoints:
             cp["active"] = False
         for p in self.platforms:
@@ -640,6 +695,22 @@ class World(object):
                 coin["taken"] = True
                 self.taken_coins += 1
                 got += 1
+        return got
+
+    def collect_items(self, player_rect):
+        """拾取道具，返回本次拿到的道具名列表（目前只有 "glider"）。
+
+        和金币分开算：金币是"收集度"，道具是"能力解锁"，混在一起会让
+        HUD 上的金币数被道具干扰。
+        """
+        got = []
+        for it in self.gliders:
+            if it["taken"]:
+                continue
+            if player_rect.colliderect(it["rect"]):
+                it["taken"] = True
+                self.glider_taken += 1
+                got.append("glider")
         return got
 
     # ---- 绘制 ----
@@ -740,6 +811,9 @@ class World(object):
 
         for cp in self.checkpoints:
             self._draw_checkpoint(surface, cp, ox, oy)
+        for it in self.gliders:
+            if not it["taken"]:
+                self._draw_glider_item(surface, it, ox, oy)
         for p in self.platforms:
             self._draw_platform(surface, p, ox, oy)
 
@@ -762,15 +836,29 @@ class World(object):
         tile = config.TILE
         x, y = col * tile, row * tile
         if ch == "~":
-            rect = pygame.Rect(x + 2, y + 2, tile - 4, tile - 4)
+            # 整格铺满而不是内缩：内缩 2px 会让相邻两格之间留下纸色细缝，
+            # 一片水坑看起来像一排独立的小方块。
+            rect = pygame.Rect(x, y, tile, tile)
             pygame.draw.rect(surface, config.COLOR_WATER, rect)
             for k in (0, 1):
                 pts = []
-                for seg in range(0, tile, 8):
+                # 取到 tile 为止（含右边界）：只画到 56 的话，每格末尾空 8px，
+                # 整片水会变成一排虚线。
+                for seg in range(0, tile + 1, 8):
                     yy = y + 18 + k * 22 + int(2.4 * math.sin((x + seg) / 9.0))
                     pts.append((x + seg, yy))
                 pygame.draw.lines(surface, (140, 176, 196), False, pts, 2)
-            pygame.draw.rect(surface, (140, 176, 196), rect, 2)
+            # 只在"邻格不是水"的一侧描边。每格都描边的话，一片水坑会变成
+            # 一排蓝色方格，看着像瓷砖而不是水。
+            edges = (((rect.left, rect.top), (rect.left, rect.bottom)),
+                     ((rect.right, rect.top), (rect.right, rect.bottom)),
+                     ((rect.left, rect.top), (rect.right, rect.top)),
+                     ((rect.left, rect.bottom), (rect.right, rect.bottom)))
+            neighbours = ((-1, 0), (1, 0), (0, -1), (0, 1))
+            for (a, b), (dc, dr) in zip(edges, neighbours):
+                if self.cell_at_px(x + dc * tile + tile // 2,
+                                   y + dr * tile + tile // 2) != "~":
+                    pygame.draw.line(surface, (140, 176, 196), a, b, 2)
             return
 
         # 尖刺：四颗齿，齿高 24px，贴着格子下沿（'^'）或上沿（'v'）
@@ -842,6 +930,20 @@ class World(object):
             rad = max(1, int(3.0 * (1.0 - t)))
             pygame.draw.circle(surface, config.COLOR_CAMP, (sx, sy), rad)
 
+    def _draw_glider_item(self, surface, it, ox, oy):
+        """地上的滑翔伞道具：小伞面 + 两条绳 + 握把，上下轻轻浮动。
+
+        素材包里没有道具图，代码画反而更统一——和篝火的兜底绘制是同一套语言。
+        """
+        bob = int(round(math.sin(self.time * 2.6 + it["phase"]) * 3))
+        cx = it["pos"][0] + ox
+        cy = it["pos"][1] + oy + bob
+        pts = draw_canopy(surface, cx, cy - 2, half_w=18, height=13)
+        grip = (cx, cy + 12)
+        pygame.draw.line(surface, config.COLOR_INK, pts[0], grip, 1)
+        pygame.draw.line(surface, config.COLOR_INK, pts[-1], grip, 1)
+        pygame.draw.circle(surface, config.COLOR_INK, grip, 2)
+
     def _draw_platform(self, surface, p, ox, oy):
         """移动平台：白底墨框的浮板 + 两个方向箭头。
 
@@ -902,6 +1004,8 @@ class World(object):
             extra.append(u"单向平台 %d" % len(self.oneways))
         if self.hazard_boxes:
             extra.append(u"危险格 %d" % len(self.hazard_boxes))
+        if self.gliders:
+            extra.append(u"滑翔伞 %d" % len(self.gliders))
         tail = (u"，" + u"、".join(extra)) if extra else u""
         return (u"%s：%d x %d 格（%d x %d px），实心 %d 格合成 %d 个碰撞矩形，"
                 u"金币 %d 枚，终点 1 个%s" % (
