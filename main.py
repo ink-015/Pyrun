@@ -17,6 +17,7 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-m4      在机关关 l2 截一张（篝火/地刺/单向平台/移动平台）
     python main.py --smoke-death   触发一次落水死亡，截下死亡定格画面
     python main.py --smoke-glide   第 3 关：先走过去捡伞，再抓一张滑翔中的画面
+    python main.py --smoke-m6      第 4 关：NPC 对话 / 蝙蝠走廊 / 落石三张图
     python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -456,6 +457,70 @@ def main():
         print(u" 滑翔     : %s  vy=%.0f  vx=%.0f  x=%.0f（水坑 21~28 列）"
               % (p.gliding, p.vy, p.vx, p.x))
         print(" 截图   :", save_screenshot(screen, "m5_glide.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-m6" in sys.argv:
+        # M6：一次跑三个画面——NPC 对话、蝙蝠走廊、落石预警/下落
+        app.level_path = os.path.join(config.LEVEL_DIR, "l4.txt")
+        app.scenes.start("game")
+        scene = app.scenes.current
+        p = scene.player
+        scene.show_debug = False
+        W = player.Player.WIDTH
+        H = player.Player.HEIGHT
+
+        # 1) 站在老人旁边（偏右 46px，别和 NPC 叠在一起）按 E
+        npc = scene.world.npcs[0]
+        p.teleport(npc["cell"].centerx - W // 2 + 46, npc["cell"].bottom - H)
+        scene.camera.snap_to(p.rect)
+        for _ in range(6):
+            app.scenes.update(config.FIXED_DT)
+        print(u" 交互目标 : %s（%s）"
+              % (scene.world.focus["name"] if scene.world.focus else u"无",
+                 scene.world.focus["kind"] if scene.world.focus else "-"))
+        scene._try_interact()
+        for _ in range(30):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 对话     : 第 %d/%d 页「%s」  暂停中=%s"
+              % (scene.dialog.index + 1, len(scene.dialog.pages),
+                 scene.dialog.page()[:16], scene.dialog is not None))
+        print(" 截图   :", save_screenshot(screen, "m6_dialog.png"))
+
+        # 2) 蝙蝠走廊
+        scene.dialog = None
+        p.teleport(18 * config.TILE, 9 * config.TILE - H)
+        scene.camera.snap_to(p.rect)
+        for _ in range(40):
+            app.scenes.update(config.FIXED_DT)
+        b = scene.world.bats[0]
+        print(u" 蝙蝠     : x=%.0f（区间 %.0f~%.0f）y=%.0f  帧=%d"
+              % (b.cx, b.left, b.right, b.cy, len(b.frames)))
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(" 截图   :", save_screenshot(screen, "m6_bat.png"))
+
+        # 3) 落石：一直跑到有石头真的在往下掉
+        p.teleport(37 * config.TILE + 8, 11 * config.TILE - H)
+        scene.camera.snap_to(p.rect)
+        scene.invuln = 99.0             # 截图用：别被砸死，不然拍到的是死亡面板
+        falling = None
+        for _ in range(300):
+            app.scenes.update(config.FIXED_DT)
+            for r in scene.world.rocks:
+                if r.state == "fall":
+                    falling = r
+                    break
+            if falling is not None:
+                break
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 落石     : 场上 %d 块，状态 %s，已投下 %d 块"
+              % (len(scene.world.rocks),
+                 falling.state if falling else u"无", scene.world.rock_count))
+        print(" 截图   :", save_screenshot(screen, "m6_rock.png"))
         pygame.quit()
         return 0
 

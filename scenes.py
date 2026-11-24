@@ -21,6 +21,7 @@ import pygame
 import assets
 import compat
 import config
+import dialog
 import player
 import world
 
@@ -345,6 +346,13 @@ class GameScene(Scene):
         self.toast_text = ""
         self.toast_timer = 0.0
 
+        # ---- 对话（M6）----
+        # 非 None 时整局暂停：物理、敌人、计时全部冻结，只留对话自己的
+        # 呼吸动画。读字的时候还在被打、还在计时，是最容易被骂的设计。
+        self.dialog = None
+        self._dlg_font = None
+        self._dlg_body = None
+
     # ---------------------------------------------------------------- 生命周期
     def on_enter(self):
         self.input = player.InputState()
@@ -367,6 +375,7 @@ class GameScene(Scene):
         self.level_time = 0.0
         self.toast_text = ""
         self.toast_timer = 0.0
+        self.dialog = None
 
     def load_level(self, path):
         """加载关卡。失败时把错误留在 self.load_error 里，画面显示出来。
@@ -448,10 +457,21 @@ class GameScene(Scene):
     # ---------------------------------------------------------------- 输入
     def handle_event(self, event):
         if event.type == pygame.KEYDOWN:
+            # 对话打开时，除 E / Esc 之外的按键全部吞掉。不吞的话玩家会在
+            # 读字时按空格把角色跳走，回来发现人已经在坑里了。
+            if self.dialog is not None:
+                if event.key in (pygame.K_e, pygame.K_RETURN, pygame.K_SPACE):
+                    self._advance_dialog()
+                elif event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                    self.dialog = None
+                return
+
             if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
                 self.app.scenes.goto("menu")
                 return
-            if event.key == pygame.K_SPACE:
+            if event.key == pygame.K_e:
+                self._try_interact()
+            elif event.key == pygame.K_SPACE:
                 self.input.jump_pressed = True
                 self.input.jump_held = True
             elif event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
@@ -516,15 +536,59 @@ class GameScene(Scene):
             axis += 1.0
         self.input.axis = axis
 
+    # ---------------------------------------------------------------- 对话
+    def _try_interact(self):
+        """E 键：打开脚下那块牌子 / 旁边那个人的对话框。"""
+        if self.world is None or self.player is None:
+            return False
+        info = self.world.interact()
+        if info is None:
+            return False
+        name, pages, kind = info
+        if self._dlg_font is None:
+            self._dlg_font, _ = get_font(19, bold=True)
+            self._dlg_body, _ = get_font(21)
+        self.dialog = dialog.Dialog(name, pages, kind)
+        # 打开对话瞬间清速度：关掉之后不该带着"进场时的惯性"继续跑
+        self.player.vx = 0.0
+        self.input.release_edges()
+        self.input.jump_held = False
+        return True
+
+    def _advance_dialog(self):
+        if self.dialog is None:
+            return False
+        if not self.dialog.advance():
+            self.dialog = None
+        return True
+
+    def _dialog_tail(self):
+        """气泡尾巴指向屏幕上的交互对象（对象头顶的屏幕坐标）。"""
+        if self.world is None or self.world.focus is None:
+            return None
+        obj = self.world.focus
+        ox, oy = self.camera.offset
+        head = 6 if obj["kind"] == "npc" else 10   # NPC 有帽子，再高一点
+        return (obj["cell"].centerx + ox, obj["cell"].top + oy + head)
+
     # ---------------------------------------------------------------- 更新
     def update(self, dt):
         if self.world is None or self.player is None:
             return
 
+        # 对话中整局暂停：只推进对话框自己的动画。物理、敌人、落石、计时器
+        # 全部冻结——"读字的时候被石头砸死"是最没道理的一种死法。
+        if self.dialog is not None:
+            self.dialog.update(dt)
+            self.input.release_edges()
+            self.input.jump_held = False
+            self.player.vx = 0.0
+            return
+
         self._poll_axis()
         # 平台先动一步：玩家这一帧要撞的是平台的**新**位置，
         # 否则站在平台前沿时会被追尾，表现为每帧一次的小顿挫。
-        self.world.update(dt)
+        self.world.update(dt, self.player)
         if self.toast_timer > 0.0:
             self.toast_timer = max(0.0, self.toast_timer - dt)
 
@@ -590,6 +654,12 @@ class GameScene(Scene):
             if ch is not None:
                 self.die({"^": u"踩到地刺", "v": u"撞到天花板刺",
                           "~": u"落水"}.get(ch, u"碰到危险格"))
+                return
+            # 敌人判定放在危险格之后：踩刺而死比"恰好和蝙蝠重叠"更该被报告，
+            # 玩家也更认这个因果。
+            hit = self.world.enemy_hit(rect)
+            if hit is not None:
+                self.die(hit)
                 return
 
         idx = self.world.checkpoint_hit(rect)
@@ -674,7 +744,7 @@ class GameScene(Scene):
             self._draw_load_error(surface)
             return
 
-        self.world.draw(surface, self.camera)
+        self.world.draw(surface, self.camera, show_prompt=self.dialog is None)
         self._draw_player(surface)
         self._draw_hud(surface)
 
@@ -686,17 +756,28 @@ class GameScene(Scene):
         if self.toast_timer > 0.0 and self.toast_text:
             self._draw_toast(surface)
 
-        f_hint, _ = get_font(16)
-        hint = (u"← → / A D 移动   空格 跳跃（空中按住 滑翔）   Shift 冲刺   "
-                u"T 回检查点   R 重开   N 切关   F1 调试   Esc 菜单")
-        w = f_hint.size(hint)[0]
-        surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
-                     ((config.WIDTH - w) // 2, config.HEIGHT - 26))
+        # 按键提示条只在没有对话时画：对话面板就压在它上面，
+        # 半截被盖住的灰字看着像渲染坏了。
+        if self.dialog is None:
+            f_hint, _ = get_font(16)
+            hint = (u"← → / A D 移动   空格 跳跃（空中按住 滑翔）   Shift 冲刺   "
+                    u"E 看牌子 / 对话   T 回检查点   R 重开   N 切关   F1 调试   Esc 菜单")
+            w = f_hint.size(hint)[0]
+            surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
+                         ((config.WIDTH - w) // 2, config.HEIGHT - 26))
 
         if self.death_timer > 0.0:
             self._draw_death_panel(surface)
         elif self.goal_reached:
             self._draw_goal_panel(surface)
+
+        # 对话框永远在最上层：它出现时整局已暂停，被 HUD 压住就等于没打开
+        if self.dialog is not None:
+            if self._dlg_font is None:
+                self._dlg_font, _ = get_font(19, bold=True)
+                self._dlg_body, _ = get_font(21)
+            self.dialog.draw(surface, self._dlg_font, self._dlg_body,
+                             self._dialog_tail())
 
     def _draw_player(self, surface):
         """画角色：优先贴图动画，素材缺失时退回代码火柴人。

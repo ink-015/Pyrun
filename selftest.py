@@ -15,6 +15,8 @@ import pygame
 
 import assets
 import config
+import dialog
+import enemy
 import io_utils
 import player
 import scenes
@@ -1395,6 +1397,321 @@ def test_m5_scene(app):
               scene.world.total_coins, scene.deaths))
 
 
+# ---------------------------------------------------------------- M6 敌人与对话
+
+L4 = os.path.join(config.LEVEL_DIR, "l4.txt")
+
+
+def test_bat():
+    _section(u"M6 蝙蝠巡逻")
+
+    b = enemy.Bat(100.0, 200.0, 50.0)
+    lo, hi = 1e9, -1e9
+    for _ in range(600):
+        b.update(DT)
+        lo = min(lo, b.cx)
+        hi = max(hi, b.cx)
+    _check(u"蝙蝠不飞出巡逻区", lo >= 100.0 - 0.01 and hi <= 200.0 + 0.01,
+           u"x ∈ [%.1f, %.1f]，区间 [100, 200]" % (lo, hi))
+    # 600 帧 = 10 秒，行程 100px 在 70px/s 下约 1.4 秒单程，必然到过两端
+    _check(u"两端都到过（真的往返）", hi > 195.0 and lo < 105.0,
+           u"最近 %.1f / %.1f" % (lo, hi))
+    hb = b.hitbox()
+    _check(u"判定框比贴图窄", hb.width < 80 * config.BAT_SCALE,
+           u"判定 %dpx < 贴图 %.0fpx" % (hb.width, 80 * config.BAT_SCALE))
+    _check(u"判定框在贴图附近",
+           abs(hb.centerx - b.cx) <= 1 and abs(hb.centery - b.cy) <= 12,
+           u"box=%s cx=%.0f cy=%.0f" % (hb, b.cx, b.cy))
+
+    # 单格巡逻（left == right）：贴着不动，不能因为反复反向而漂移
+    still = enemy.Bat(500.0, 500.0, 300.0)
+    for _ in range(120):
+        still.update(DT)
+    _check(u"单格蝙蝠原地悬停", abs(still.cx - 500.0) < 0.01,
+           u"x=%.2f" % still.cx)
+
+
+def test_rock_timing():
+    _section(u"M6 落石时序")
+
+    r = enemy.FallingRock(100.0, 100.0, 300.0)
+    _check(u"落石先进入预警", r.state == "warn", r.state)
+    _check(u"预警期不判定伤害", r.hitbox() is None, u"hitbox=%s" % (r.hitbox(),))
+
+    frames = 0
+    while r.state == "warn" and frames < 300:
+        r.update(DT)
+        frames += 1
+    _check(u"预警约 %.1fs" % config.ROCK_WARN_TIME,
+           abs(frames * DT - config.ROCK_WARN_TIME) < 0.05,
+           u"实测 %.2fs" % (frames * DT))
+    _check(u"预警结束后开始下落", r.state == "fall", r.state)
+    _check(u"下落期才判定", r.hitbox() is not None,
+           u"box=%s" % (r.hitbox(),))
+
+    while r.state == "fall" and frames < 600:
+        r.update(DT)
+        frames += 1
+    _check(u"落到地面高度就停", abs(r.y - 300.0) < 1.0, u"y=%.1f" % r.y)
+    _check(u"落地后碎裂", r.state == "shatter", r.state)
+
+    while not r.dead and frames < 900:
+        r.update(DT)
+        frames += 1
+    _check(u"碎屑播完自动回收", r.dead, u"共 %d 帧" % frames)
+
+
+def test_dialog_layout():
+    _section(u"M6 对话排版")
+
+    font, _ = scenes.get_font(21)
+    long_text = u"石头落下前，地上会先出现一圈影子，" * 4
+    lines = dialog.wrap_text(font, long_text, 400)
+    _check(u"折行每行都不超宽",
+           all(font.size(l)[0] <= 400 for l in lines),
+           u"最宽 %dpx / 上限 400px" % max(font.size(l)[0] for l in lines))
+    _check(u"长文本被折成多行", (len(lines) >= 3) and
+           u"".join(lines) == long_text.replace(u"\n", u""),
+           u"%d 行，字符不丢" % len(lines))
+    _check(u"空行也能排版", dialog.wrap_text(font, u"", 400) == [u""])
+
+    d = dialog.Dialog(u"老人", [u"第一页", u"第二页"])
+    _check(u"从第一页开始", d.page() == u"第一页", d.page())
+    _check(u"翻页返回 True 且停在第 2 页",
+           d.advance() is True and d.page() == u"第二页", d.page())
+    _check(u"最后一页翻完就结束",
+           d.advance() is False and not d.active(), u"index=%d" % d.index)
+
+    rect, _ = d.layout(font)
+    _check(u"面板不越出屏幕",
+           rect.left >= 0 and rect.right <= config.WIDTH
+           and rect.top >= 0 and rect.bottom <= config.HEIGHT,
+           u"%s" % (rect,))
+
+
+def test_m6_parse():
+    _section(u"M6 关卡解析：告示牌 / NPC / 敌人")
+    try:
+        w = world.World.load(L4)
+    except world.LevelError as exc:
+        _check(u"l4 可加载", False, exc.describe())
+        return None
+
+    _check(u"l4 尺寸 60x14", (w.width_tiles, w.height_tiles) == (60, 14),
+           u"%d x %d" % (w.width_tiles, w.height_tiles))
+    _check(u"3 块告示牌", len(w.signs) == 3, u"%d 块" % len(w.signs))
+    _check(u"告示牌文本按出现顺序配对",
+           all(s["pages"] for s in w.signs)
+           and w.signs[0]["pages"][0].startswith(u"空格跳"),
+           u"第一块「%s」" % w.signs[0]["pages"][0][:14])
+    _check(u"1 个 NPC 且叫老人",
+           len(w.npcs) == 1 and w.npcs[0]["name"] == u"老人",
+           u"%s" % [n["name"] for n in w.npcs])
+    _check(u"NPC 有 3 页台词", len(w.npcs[0]["pages"]) == 3,
+           u"%d 页" % len(w.npcs[0]["pages"]))
+    _check(u"2 只蝙蝠（连续 B 合并成巡逻段）", len(w.bats) == 2,
+           u"%d 只：%s" % (len(w.bats),
+                          [(b.left, b.right) for b in w.bats]))
+    _check(u"1 个 UFO", len(w.ufos) == 1, u"%d 个" % len(w.ufos))
+    _check(u"3 处落石点", len(w.rock_spawners) == 3,
+           u"%d 处" % len(w.rock_spawners))
+
+    # 敌人不能生在实心里，否则玩家看不见、也躲不开
+    bad = [b for b in w.bats if w.is_solid_px(b.cx, b.cy)]
+    _check(u"蝙蝠不在实心里", not bad, u"%d 只异常" % len(bad))
+    bad = [u for u in w.ufos if w.is_solid_px(u.cx, u.cy)]
+    _check(u"UFO 不在实心里", not bad, u"%d 个异常" % len(bad))
+
+    # 落石点必须在天花板下方，且落点有地面（不然影子画到地图外）
+    _check(u"落石点上方是天板",
+           all(w.is_solid_px(s.cx, s.top_y - 10) for s in w.rock_spawners),
+           u"%s" % [w.cell_at_px(s.cx, s.top_y - 10) for s in w.rock_spawners])
+    _check(u"落石点有落点地面",
+           all(s.ground_y < w.bounds.bottom for s in w.rock_spawners),
+           u"%s" % [s.ground_y for s in w.rock_spawners])
+
+    # 告示牌/NPC 要站在地面上
+    for obj in w.signs + w.npcs:
+        _check(u"%s 脚下是地面" % obj["name"],
+               w.is_solid_px(obj["cell"].centerx, obj["cell"].bottom + 4),
+               u"cell=(%d,%d)" % (obj["col"], obj["row"]))
+
+    return w
+
+
+def test_m6_errors():
+    _section(u"M6 关卡文本的错误提示")
+
+    cases = [
+        (u"未知指令", u";!foo 随便\nP..S\n####\n", u"未知指令"),
+        (u"牌子没有文本", u"P..S\n####\n", u"告示牌数量对不上"),
+        (u"文本多一条", u";!sign 喂\nP...\n####\n", u"告示牌数量对不上"),
+        (u"sign 后面没字", u";!sign\nP.S.\n####\n", u"没有文字"),
+        (u"npc 格式缺页", u";!npc 老人\nP.N.\n####\n", u"格式"),
+    ]
+    for name, text, want in cases:
+        path = _temp_level("e.txt", text)
+        try:
+            world.World.load(path)
+            _check(u"%s 应当报错" % name, False, u"没报错")
+        except world.LevelError as exc:
+            msg = exc.describe()
+            _check(u"%s" % name, want in msg, msg.splitlines()[0])
+
+
+def test_m6_scene(app):
+    _section(u"M6 对话暂停 / 敌人致死 / 重开复位")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L4)
+    w = scene.world
+    if w is None:
+        _check(u"l4 可加载", False, scene.load_error)
+        return
+    W = player.Player.WIDTH
+    H = player.Player.HEIGHT
+
+    # ---- 靠近 NPC -> 出现 E 提示 ----
+    npc = w.npcs[0]
+    scene.player.teleport(npc["cell"].centerx - W // 2 - 30,
+                          npc["cell"].bottom - H)
+    _run(scene, 3)
+    _check(u"靠近 NPC 出现交互提示",
+           w.focus is not None and w.focus["kind"] == "npc",
+           u"focus=%s" % (w.focus["name"] if w.focus else None))
+
+    # ---- 按 E 打开对话，整局暂停 ----
+    ok = scene._try_interact()
+    _check(u"E 打开对话", ok and scene.dialog is not None,
+           u"pages=%d" % (len(scene.dialog.pages) if scene.dialog else 0))
+    x0, t0, wt0 = scene.player.x, scene.level_time, w.time
+    _run(scene, 60)
+    _check(u"对话中玩家不动", abs(scene.player.x - x0) < 0.01,
+           u"x %.1f -> %.1f" % (x0, scene.player.x))
+    _check(u"对话中关卡计时冻结", abs(scene.level_time - t0) < 1e-9,
+           u"%.3fs" % scene.level_time)
+    _check(u"对话中世界也停（敌人不投弹）", abs(w.time - wt0) < 1e-9,
+           u"world.time=%.3f" % w.time)
+
+    # ---- 翻页到底自动关闭 ----
+    pages = len(scene.dialog.pages)
+    for _ in range(pages):
+        scene._advance_dialog()
+    _check(u"翻完最后一页自动关闭", scene.dialog is None, u"%d 页" % pages)
+    _check(u"关掉后能重新打开", scene._try_interact() and scene.dialog is not None)
+    scene.dialog = None
+
+    # ---- 走远就没有提示 ----
+    scene.player.teleport(npc["cell"].centerx - 320, npc["cell"].bottom - H)
+    _run(scene, 3)
+    _check(u"走远后提示消失", w.focus is None,
+           u"focus=%s" % (w.focus["name"] if w.focus else None))
+
+    # ---- 告示牌同样能读 ----
+    sign = w.signs[0]
+    scene.player.teleport(sign["cell"].centerx - W // 2 - 24,
+                          sign["cell"].bottom - H)
+    _run(scene, 3)
+    _check(u"靠近告示牌出现提示",
+           w.focus is not None and w.focus["kind"] == "sign",
+           u"focus=%s" % (w.focus["name"] if w.focus else None))
+    _check(u"告示牌对话的第一页是按键说明",
+           scene._try_interact() and u"空格" in scene.dialog.page(),
+           scene.dialog.page()[:14] if scene.dialog else u"-")
+    scene.dialog = None
+
+    # ---- 蝙蝠撞死 ----
+    scene.restart()
+    b = w.bats[0]
+    scene.player.teleport(b.cx - W // 2, b.cy - H // 2)
+    scene.invuln = 0.0
+    _run(scene, 1)
+    _check(u"碰到蝙蝠会死",
+           scene.deaths == 1 and u"蝙蝠" in scene.last_death_cause,
+           u"死亡 %d 次，原因「%s」" % (scene.deaths, scene.last_death_cause))
+
+    # ---- 落石砸死 ----
+    scene.restart()
+    rs = w.rock_spawners[0]
+    scene.player.teleport(rs.cx - W // 2, rs.ground_y - H)
+    scene.invuln = 0.0
+    for _ in range(300):
+        _run(scene, 1)
+        if scene.deaths:
+            break
+    _check(u"落石能砸死玩家",
+           scene.deaths >= 1 and u"落石" in scene.last_death_cause,
+           u"死亡 %d 次，原因「%s」，投下 %d 块"
+           % (scene.deaths, scene.last_death_cause, w.rock_count))
+
+    # ---- 重开复位 ----
+    scene.restart()
+    b = w.bats[0]
+    _check(u"重开后场上没有落石",
+           not w.rocks and w.rock_count == 0, u"%d 块" % len(w.rocks))
+    _check(u"重开后蝙蝠回到中位",
+           abs(b.cx - (b.left + b.right) * 0.5) < 1.0, u"x=%.0f" % b.cx)
+    _check(u"重开后交互目标清空", w.focus is None, u"focus=%s" % (w.focus,))
+
+
+def _auto_step(scene):
+    """一个"会看路"的自动驾驶：前方没地、或者有墙，就起跳。
+
+    为什么不沿用 l3 那套"落地就跳"：那套只在小坑面前碰巧成立，遇到
+    台阶 + 坑相邻的段落会踩空（实测在 l4 的第 8 列必死）。这里多看一眼
+    前方 30px 有没有地、6px 处有没有墙，就足够把一个纯地形关跑完——
+    它证明的是"地形没画死"，不是"我操作好"。
+    """
+    p = scene.player
+    w = scene.world
+    if not p.on_ground:
+        scene.input.jump_held = True
+        return
+    gap_ahead = not w.is_solid_px(p.rect.right + 30, p.rect.bottom + 6)
+    wall_ahead = w.is_solid_px(p.rect.right + 6, p.rect.bottom - 12)
+    if gap_ahead or wall_ahead:
+        scene.input.jump_pressed = True
+        scene.input.jump_held = True
+    else:
+        scene.input.jump_held = False
+
+
+def test_m6_playable(app):
+    _section(u"M6 第 4 关地形可通关")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L4)
+    w = scene.world
+    if w is None:
+        _check(u"l4 可加载", False, scene.load_error)
+        return
+
+    # 关掉敌人再跑：这一条测的是**地形**能不能过，不是能不能躲。
+    # 混在一起的话，跑图失败时无法区分"关卡画错了"和"这次运气不好"。
+    # 三个列表都要清：enemy_hit 查的是 bats/rocks，不看 enemies。
+    w.bats = []
+    w.ufos = []
+    w.rock_spawners = []
+    w.enemies = []
+    w.rocks = []
+
+    scene.override_axis = 1.0
+    frames = 0
+    for f in range(3600):
+        _auto_step(scene)
+        scene.update(DT)
+        frames = f
+        if scene.goal_reached:
+            break
+    scene.override_axis = None
+    scene.input.jump_held = False
+    _check(u"l4 从出生点一路跑到终点", scene.goal_reached,
+           u"%d 帧（%.1f 秒），金币 %d/%d，死亡 %d"
+           % (frames, frames * DT, w.taken_coins, w.total_coins, scene.deaths))
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -1415,6 +1732,13 @@ def run(app):
     test_m4_scene(app)
     test_glide()
     test_m5_scene(app)
+    test_bat()
+    test_rock_timing()
+    test_dialog_layout()
+    test_m6_parse()
+    test_m6_errors()
+    test_m6_scene(app)
+    test_m6_playable(app)
     test_level_parse()
     test_level_errors()
     test_camera()

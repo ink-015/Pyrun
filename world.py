@@ -19,6 +19,7 @@ import pygame
 import assets
 import compat
 import config
+import enemy
 import io_utils
 
 # ---------------------------------------------------------------- 图例
@@ -33,6 +34,11 @@ TILE_COIN = "c"
 TILE_BOUNCE = "J"
 TILE_CHECK = "C"
 TILE_GLIDER = "G"
+TILE_SIGN = "S"
+TILE_NPC = "N"
+TILE_BAT = "B"
+TILE_UFO = "U"
+TILE_ROCK = "R"
 
 LEGEND = {
     ".": u"空气",
@@ -115,8 +121,41 @@ class _Parsed(object):
         self.checkpoints = []     # [(col, row)]
         self.bouncers = []        # [(col, row)]
         self.gliders = []         # [(col, row)]  M5 道具
+        self.signs = []           # [(col, row)]  M6 告示牌
+        self.npcs = []            # [(col, row)]  M6 NPC
+        self.bats = []            # [(col, row)]  M6 蝙蝠（连续段稍后合并）
+        self.ufos = []            # [(col, row)]
+        self.rock_spawns = []     # [(col, row)]  天花板裂缝
         self.platforms = []       # [(col, row, ch)]  同字符连续段稍后合并
         self.others = []          # [(col, row, ch)]  已识别但暂未实现
+        # M6 文本：按文件出现顺序排队，与地图里 S / N 的出现顺序一一配对
+        self.sign_pages = []      # [(file_line, [页...])]
+        self.npc_pages = []       # [(file_line, 名字, [页...])]
+
+
+def _directive(text):
+    """识别 ``;!sign ...`` / ``;!npc ...`` 这类数据指令行。
+
+    为什么用注释行存文本：地图必须是严格矩形，把整段中文塞进格子里会
+    直接把列宽搞崩；而注释行天生"不参与地图"，又有真实行号可以报错。
+    代价是文本与牌子靠**出现顺序**配对（不是坐标），所以数量不一致时
+    必须报错，不能默默错位。
+    """
+    body = text.strip()
+    if not body.startswith(";!"):
+        return None
+    body = body[2:].strip()
+    if not body:
+        return None
+    parts = body.split(None, 1)
+    name = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    return name, rest
+
+
+def _split_pages(text):
+    """把 ``第一页|第二页`` 拆成页列表，丢掉空页。"""
+    return [p.strip() for p in text.split("|") if p.strip()]
 
 
 def _parse(path):
@@ -132,6 +171,28 @@ def _parse(path):
 
     for i, text in enumerate(raw_lines, 1):
         if _is_skippable(text):
+            # 注释行里可能藏着告示牌/NPC 的文本，先过一遍指令
+            cmd = _directive(text)
+            if cmd is not None:
+                name, rest = cmd
+                if name == "sign":
+                    pages = _split_pages(rest)
+                    if not pages:
+                        raise LevelError(path, i, u";!sign 后面没有文字")
+                    out.sign_pages.append((i, pages))
+                elif name == "npc":
+                    # 第一段是名字，其余是页
+                    chunks = [c.strip() for c in rest.split("|")]
+                    who = chunks[0] if chunks else u""
+                    pages = [c for c in chunks[1:] if c]
+                    if not who or not pages:
+                        raise LevelError(
+                            path, i,
+                            u";!npc 格式是「;!npc 名字|第一页|第二页」")
+                    out.npc_pages.append((i, who, pages))
+                else:
+                    raise LevelError(
+                        path, i, u"未知指令 ;!%s（只认识 sign / npc）" % name)
             continue
         line = text.rstrip("\r\n")
         if width is None:
@@ -169,12 +230,35 @@ def _parse(path):
                 out.bouncers.append((col, row))
             elif ch == TILE_GLIDER:
                 out.gliders.append((col, row))
+            elif ch == TILE_SIGN:
+                out.signs.append((col, row))
+            elif ch == TILE_NPC:
+                out.npcs.append((col, row))
+            elif ch == TILE_BAT:
+                out.bats.append((col, row))
+            elif ch == TILE_UFO:
+                out.ufos.append((col, row))
+            elif ch == TILE_ROCK:
+                out.rock_spawns.append((col, row))
             elif ch in ("M", "m"):
                 out.platforms.append((col, row, ch))
             elif ch in HAZARD_CHARS:
                 out.hazards.append((col, row, ch))
             elif ch not in (".", TILE_SOLID):
                 out.others.append((col, row, ch))
+
+    # 牌子必须配文本，文本也不能多出来。数量对不上就直接报，
+    # 否则"第 3 块牌子显示第 4 段话"这种错要靠玩家读起来才发现。
+    if len(out.signs) != len(out.sign_pages):
+        raise LevelError(
+            path, 0,
+            u"告示牌数量对不上：地图里 %d 个 S，文本 %d 条 ;!sign"
+            % (len(out.signs), len(out.sign_pages)))
+    if len(out.npcs) != len(out.npc_pages):
+        raise LevelError(
+            path, 0,
+            u"NPC 数量对不上：地图里 %d 个 N，文本 %d 条 ;!npc"
+            % (len(out.npcs), len(out.npc_pages)))
 
     if not out.spawn:
         raise LevelError(path, 0, u"缺少出生点 P（每关必须且只能有一个）")
@@ -323,6 +407,43 @@ def _platform_runs(cells):
         out.append(MovingPlatform(
             (start * tile, row * tile, (prev - start + 1) * tile, tile // 2),
             "x" if ch == "M" else "y"))
+    return out
+
+
+# ---------------------------------------------------------------- 蝙蝠巡逻段
+
+def _bat_runs(cells):
+    """把同一行里连续的 'B' 合成一条巡逻线，返回 [(左像素, 右像素, 中心y)]。
+
+    巡逻区间取"首格中心 → 末格中心"，而不是格子边界：蝙蝠的判定框只有
+    30px 宽，贴着格子边缘折返时会有一小段完全悬在墙里。
+    """
+    by_row = {}
+    for col, row in cells:
+        by_row.setdefault(row, []).append(col)
+
+    tile = config.TILE
+    out = []
+    for row in sorted(by_row):
+        cols = sorted(by_row[row])
+        start = prev = cols[0]
+        runs = []
+        for c in cols[1:]:
+            if c == prev + 1:
+                prev = c
+                continue
+            runs.append((start, prev))
+            start = prev = c
+        runs.append((start, prev))
+        for a, b in runs:
+            # 超长段拆成几段短巡逻，而不是拉一屏长线：一张图画错了不该让
+            # 整关打不开，但也不能让蝙蝠横穿半个屏幕、玩家只能干等。
+            step = config.BAT_PATROL_MAX
+            while a <= b:
+                tail = min(b, a + step - 1)
+                out.append((a * tile + tile // 2, tail * tile + tile // 2,
+                            row * tile + tile // 2))
+                a = tail + 1
     return out
 
 
@@ -549,6 +670,39 @@ class World(object):
         self.glider_total = len(self.gliders)
         self.glider_taken = 0
 
+        # ---- 告示牌与 NPC（M6）----
+        # 文本来自地图注释里的 ;!sign / ;!npc，解析器已保证数量一一对应。
+        self.signs = []
+        for (c, r), (line_no, pages) in zip(parsed.signs, parsed.sign_pages):
+            self.signs.append(self._make_talker("sign", c, r, u"告示牌",
+                                                pages, line_no))
+        self.npcs = []
+        for (c, r), (line_no, who, pages) in zip(parsed.npcs, parsed.npc_pages):
+            self.npcs.append(self._make_talker("npc", c, r, who, pages, line_no))
+        self.focus = None          # {"kind", "obj"}：当前可交互目标
+        self.talked = set()        # 已经读过的对象下标集合（(kind, i)）
+
+        # ---- 敌人（M6）----
+        self.bats = [enemy.Bat(a, b, y) for a, b, y in _bat_runs(parsed.bats)]
+        self.ufos = [enemy.Ufo(c * tile + tile // 2, r * tile + tile // 2)
+                     for c, r in parsed.ufos]
+        self.rock_spawners = []
+        for i, (c, r) in enumerate(parsed.rock_spawns):
+            ground = self.ground_y_below(c * tile + tile // 2,
+                                         (r + 1) * tile)
+            if ground is None:
+                ground = self.bounds.bottom
+            # 裂缝画在格子顶边（也就是天花板的底面），石头从那儿掉
+            self.rock_spawners.append(
+                enemy.RockSpawner(c * tile + tile // 2, r * tile,
+                                  ground, (0.35 + 0.27 * i) % 1.0))
+        self.rock_spawners.sort(key=lambda s: s.cx)
+        # 更新顺序：会发石头的（UFO/裂缝）在前，之后统一推进已有的石头
+        self.enemies = list(self.ufos) + list(self.rock_spawners) + list(self.bats)
+        self.rocks = []            # 场上的落石，碎完自动回收
+        self.rock_count = 0        # 累计投下多少块，调试与自检用
+        self._prompt_font = None   # 惰性取字体，避免每帧查缓存表
+
         self.time = 0.0
         self.flag_img = None
         self.coin_img = None
@@ -615,11 +769,30 @@ class World(object):
         return None
 
     # ---- 更新 ----
-    def update(self, dt):
+    def update(self, dt, player=None):
+        """推进一帧。
+
+        ``player`` 可以为 None（加载后先画一帧、脱机测试），这时敌人照样动，
+        但不会投石、也不刷新可交互目标——没有玩家就没有"射程"和"靠近"。
+        """
         self.time += dt
         if self.platforms:
             for p in self.platforms:
                 p.update(dt)
+
+        if self.enemies:
+            for e in self.enemies:
+                req = e.update(dt, player)
+                if req:
+                    self._spawn_rock(req)
+        if self.rocks:
+            for r in self.rocks:
+                r.update(dt, player)
+            if any(r.dead for r in self.rocks):
+                # 只在真的有石头碎完时才重建列表，避免每帧新建对象
+                self.rocks = [r for r in self.rocks if not r.dead]
+
+        self._update_focus(player)
 
     def collision_solids(self):
         """本帧玩家要撞的实心矩形：地形 + 移动平台。
@@ -682,8 +855,90 @@ class World(object):
             p.dwell = 0.0
             p.rect.x, p.rect.y = p.origin
             p.delta = (0, 0)
+        for e in self.enemies:
+            e.reset()
+        self.rocks = []
+        self.rock_count = 0
+        self.focus = None
         self.goal_reached = False
         self.time = 0.0
+        self.talked = set()
+
+    # ---- 交互：告示牌与 NPC（M6）----
+    def _make_talker(self, kind, col, row, name, pages, line_no):
+        """一块牌子或一个 NPC。zone 是"能触发对话"的范围。
+
+        zone 比格子高一倍（含上方那格），因为玩家是站在牌子脚下那格读的，
+        眼睛却在牌子那一格。只按格子算，会出现"明明脸贴着脸却没反应"。
+        """
+        tile = config.TILE
+        cell = pygame.Rect(col * tile, row * tile, tile, tile)
+        return {
+            "kind": kind,
+            "col": col, "row": row,
+            "name": name,
+            "pages": list(pages),
+            "line": line_no,
+            "cell": cell,
+            "zone": pygame.Rect(cell.x - 12, cell.y - tile,
+                                tile + 24, tile * 2),
+        }
+
+    def _update_focus(self, player):
+        """算出离玩家最近的可交互对象。每帧算一次，绘制与按键共用。"""
+        self.focus = None
+        if player is None or not (self.signs or self.npcs):
+            return
+        best = None
+        best_d = None
+        for obj in self.signs + self.npcs:
+            if not obj["zone"].colliderect(player.rect):
+                continue
+            rng = (config.NPC_RANGE if obj["kind"] == "npc"
+                   else config.SIGN_RANGE)
+            d = abs(obj["cell"].centerx - player.rect.centerx)
+            if d > rng:
+                continue
+            if best_d is None or d < best_d:
+                best, best_d = obj, d
+        self.focus = best
+
+    def interact(self):
+        """返回 (说话人, 页列表, 类型)；没有可交互对象时返回 None。
+
+        类型是 "npc" / "sign"，画面层据此决定画不画名字——牌子没人说话。
+        """
+        obj = self.focus
+        if obj is None:
+            return None
+        self.talked.add((obj["kind"], obj["col"], obj["row"]))
+        return (obj["name"], list(obj["pages"]), obj["kind"])
+
+    # ---- 敌人（M6）----
+    def enemy_hit(self, rect):
+        """玩家判定盒是否撞上敌人，返回死亡原因或 None。
+
+        只查蝙蝠和正在下落的石头。UFO 与天花板裂缝本身不带判定：
+        "头顶有个碰不得的东西"在跑酷里是纯噪音。
+        """
+        for b in self.bats:
+            box = b.hitbox()
+            if box is not None and rect.colliderect(box):
+                return u"被蝙蝠撞到"
+        for r in self.rocks:
+            box = r.hitbox()
+            if box is not None and rect.colliderect(box):
+                return u"被落石砸中"
+        return None
+
+    def _spawn_rock(self, req):
+        _, x, y = req
+        ground = self.ground_y_below(x, y)
+        if ground is None:
+            # 落点下面是水或深渊：石头一路掉到地图底再碎，玩家本来也会死
+            ground = self.bounds.bottom
+        self.rocks.append(enemy.FallingRock(x, y, ground))
+        self.rock_count += 1
 
     def collect(self, player_rect):
         """拾取与玩家碰撞盒相交的金币，返回本次吃到的个数。"""
@@ -768,6 +1023,7 @@ class World(object):
         tile = config.TILE
         x, y = col * tile, row * tile
         above_air = (col, row - 1) not in self.solid_cells
+        below_air = (col, row + 1) not in self.solid_cells
         left_air = (col - 1, row) not in self.solid_cells
         right_air = (col + 1, row) not in self.solid_cells
 
@@ -779,6 +1035,15 @@ class World(object):
                 hx = x + i * step - 3 + int(self._hash(col, row, i) * 3)
                 top = y + 16 + int(self._hash(col, row, i + 40) * 4)
                 pygame.draw.line(surface, hatch, (hx, top), (hx, top + 14), 1)
+        elif below_air:
+            # 悬空岩板：纹理画在**底边**上方，像石头的茬口。
+            # 画在顶上会和"地面草地"撞衫——天花板顶上长草很出戏。
+            hatch = (232, 228, 218)
+            step = 13
+            for i in range(1, tile // step + 1):
+                hx = x + i * step - 4 + int(self._hash(col, row, i + 7) * 3)
+                bottom = y + tile - 8 - int(self._hash(col, row, i + 60) * 4)
+                pygame.draw.line(surface, hatch, (hx, bottom), (hx, bottom - 16), 1)
 
         # 顶线：分段微抖，看起来像手画的
         if above_air:
@@ -786,6 +1051,16 @@ class World(object):
             for seg in range(0, tile + 1, 8):
                 jitter = int(self._hash(col * 8 + seg, row, 7) * 3) - 1
                 pts.append((x + seg, y + 1 + jitter))
+            pygame.draw.lines(surface, config.COLOR_INK, False, pts, 3)
+
+        # 底边线：只画"脚下是空的"那些格子——悬空岩板的底面。
+        # 不画的话，天花板就是一大片没有边界的浅色，玩家看不出那是一块
+        # 会掉石头的岩板。（M6 加天花板时发现的：原本只画顶面与侧面。）
+        if below_air:
+            pts = []
+            for seg in range(0, tile + 1, 8):
+                jitter = int(self._hash(col * 8 + seg, row, 11) * 3) - 1
+                pts.append((x + seg, y + tile - 2 + jitter))
             pygame.draw.lines(surface, config.COLOR_INK, False, pts, 3)
 
         # 侧边线：只有临空一侧才画，避免内部出现多余竖线
@@ -796,7 +1071,7 @@ class World(object):
             pygame.draw.line(surface, config.COLOR_INK, (x + tile - 1, y + 2),
                              (x + tile - 1, y + tile), 2)
 
-    def draw(self, surface, camera):
+    def draw(self, surface, camera, show_prompt=True):
         """画地图：地形整块 blit，会动的部分单独画。"""
         ox, oy = camera.offset
         surface.blit(self.bg, (ox, oy))
@@ -817,7 +1092,22 @@ class World(object):
         for p in self.platforms:
             self._draw_platform(surface, p, ox, oy)
 
+        for s in self.signs:
+            self._draw_sign(surface, s, ox, oy)
+        for n in self.npcs:
+            self._draw_npc(surface, n, ox, oy)
+        for b in self.bats:
+            b.draw(surface, ox, oy)
+        for u in self.ufos:
+            u.draw(surface, ox, oy)
+        for s in self.rock_spawners:
+            s.draw(surface, ox, oy)
+        for r in self.rocks:
+            r.draw(surface, ox, oy)
+
         self._draw_goal(surface, ox, oy)
+        if show_prompt:
+            self._draw_focus_prompt(surface, ox, oy)
 
     def _draw_plank(self, surface, rect):
         """单向平台：一块薄板。顶面加粗线，让"能站"这件事一眼可见。
@@ -967,6 +1257,92 @@ class World(object):
                     (tipx + px * side - dx * 5, tipy + py * side - dy * 5),
                     (tipx, tipy), 2)
 
+    # ---- 告示牌 / NPC（M6）----
+    def _draw_sign(self, surface, sign, ox, oy):
+        """木牌：一根柱子 + 一块歪一点的板子 + 三行示意文字。
+
+        板子上的"字"是三根短横线而不是真文字：64px 宽的板子上写中文既看不清
+        也读不完，玩家真正要读的内容在按 E 之后的面板里。横线只承担
+        "这是一块写着东西的牌子"这一个信息。
+        """
+        cell = sign["cell"].move(ox, oy)
+        cx = cell.centerx
+        base = cell.bottom - 2
+        top = cell.top + 14
+        pygame.draw.line(surface, config.COLOR_INK, (cx, base), (cx, top + 20), 3)
+
+        board = pygame.Rect(cx - 25, top, 50, 34)
+        pygame.draw.rect(surface, (252, 246, 232), board)
+        pygame.draw.rect(surface, config.COLOR_SIGN, board, 3)
+        for i, w in enumerate((30, 26, 18)):
+            y = board.top + 8 + i * 9
+            pygame.draw.line(surface, config.COLOR_SIGN,
+                             (board.left + 10, y), (board.left + 10 + w, y), 2)
+
+    def _draw_npc(self, surface, npc, ox, oy):
+        """NPC：比主角矮一点、戴草帽、拄拐的火柴人。
+
+        为什么要戴帽子、拿拐：素材里的角色全是同一副火柴人骨架，只靠动作
+        区分"这是谁"根本不成立。帽子和拐是两笔成本最低的"身份标记"。
+        """
+        cell = npc["cell"].move(ox, oy)
+        cx = cell.centerx
+        base = cell.bottom - 2
+        breathe = math.sin(self.time * 1.9 + npc["col"]) * 1.5
+        head_y = base - 52 + breathe
+        body_y = head_y + 18
+
+        pygame.draw.circle(surface, config.COLOR_INK, (cx, int(head_y)), 8, 2)
+        pygame.draw.line(surface, config.COLOR_INK, (cx, head_y + 8),
+                         (cx, body_y + 16), 3)
+        pygame.draw.line(surface, config.COLOR_INK, (cx, body_y + 2),
+                         (cx - 11, body_y + 12), 3)
+        pygame.draw.line(surface, config.COLOR_INK, (cx, body_y + 2),
+                         (cx + 11, body_y + 6), 3)
+        pygame.draw.line(surface, config.COLOR_INK, (cx, body_y + 16),
+                         (cx - 9, base), 3)
+        pygame.draw.line(surface, config.COLOR_INK, (cx, body_y + 16),
+                         (cx + 9, base), 3)
+        # 草帽：一条帽檐 + 一个帽顶三角形
+        pygame.draw.line(surface, config.COLOR_NPC, (cx - 14, head_y - 7),
+                         (cx + 14, head_y - 7), 3)
+        pygame.draw.polygon(surface, config.COLOR_NPC,
+                            [(cx - 9, head_y - 7), (cx, head_y - 20),
+                             (cx + 9, head_y - 7)])
+        # 拐杖
+        pygame.draw.line(surface, config.COLOR_SIGN, (cx + 15, base),
+                         (cx + 15, body_y + 2), 2)
+
+    def _draw_focus_prompt(self, surface, ox, oy):
+        """可交互目标头顶的小气泡：一个白底墨框的 E。
+
+        只在真正进圈时出现。常驻的 "E" 会让画面到处是标签，玩家反而不知道该
+        按哪个；出现即意味着"现在按有用"。
+        """
+        obj = self.focus
+        if obj is None:
+            return
+        cell = obj["cell"].move(ox, oy)
+        cx = cell.centerx
+        y = cell.top - config.PROMPT_LIFT - 8
+        bob = int(round(math.sin(self.time * 4.0) * 2))
+        y += bob
+        box = pygame.Rect(cx - 13, y - 14, 26, 24)
+        compat.rounded_rect(surface, (255, 255, 255), box, radius=7, width=0)
+        compat.rounded_rect(surface, config.COLOR_INK, box, radius=7, width=2)
+        pygame.draw.polygon(surface, (255, 255, 255),
+                            [(cx - 4, box.bottom - 1), (cx + 4, box.bottom - 1),
+                             (cx, box.bottom + 6)])
+        pygame.draw.line(surface, config.COLOR_INK,
+                         (cx - 4, box.bottom), (cx, box.bottom + 6), 2)
+        pygame.draw.line(surface, config.COLOR_INK,
+                         (cx, box.bottom + 6), (cx + 4, box.bottom), 2)
+        if self._prompt_font is None:
+            self._prompt_font, _ = assets.font(15, True)
+        img = self._prompt_font.render(u"E", True, config.COLOR_INK)
+        surface.blit(img, (cx - img.get_width() // 2,
+                           box.centery - img.get_height() // 2 - 1))
+
     def _draw_coin(self, surface, cx, cy):
         if self.coin_img is not None:
             rect = self.coin_img.get_rect(center=(cx, cy))
@@ -1006,6 +1382,16 @@ class World(object):
             extra.append(u"危险格 %d" % len(self.hazard_boxes))
         if self.gliders:
             extra.append(u"滑翔伞 %d" % len(self.gliders))
+        if self.bats:
+            extra.append(u"蝙蝠 %d" % len(self.bats))
+        if self.ufos:
+            extra.append(u"UFO %d" % len(self.ufos))
+        if self.rock_spawners:
+            extra.append(u"落石点 %d" % len(self.rock_spawners))
+        if self.signs:
+            extra.append(u"告示牌 %d" % len(self.signs))
+        if self.npcs:
+            extra.append(u"NPC %d" % len(self.npcs))
         tail = (u"，" + u"、".join(extra)) if extra else u""
         return (u"%s：%d x %d 格（%d x %d px），实心 %d 格合成 %d 个碰撞矩形，"
                 u"金币 %d 枚，终点 1 个%s" % (
