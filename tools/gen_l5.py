@@ -32,6 +32,11 @@ RUN_SPEED = 300.0
 GLIDE_FALL = 120.0
 GLIDE_SPEED = 330.0
 
+# 与 config.py 同步（这里不 import config，避免拉起 pygame 初始化）
+PLAYER_H = 70           # player.Player.HEIGHT
+ROTOR_ARM = 42.0        # config.ROTOR_ARM_LEN
+ROTOR_TIP = 8           # config.ROTOR_TIP_R
+
 
 def build():
     grid = [["."] * W for _ in range(H)]
@@ -67,19 +72,22 @@ def build():
     for c in (7, 8, 9):
         put(c, 10, "Z")
 
-    # ---- 刺轮：等它扫过去 ----
+    # ---- 刺轮：吊在横梁下的低空刀片，贴着地面跑过，跳起来才挨 ----
+    for c in (15, 16, 17):
+        solid(c, 8)           # 横梁（刺轮的吊点就在 X 格顶边）
+    put(13, 10, "S")          # 告示牌 2：讲刀片（必须放在刺轮**左边**）
     put(16, 9, "X")
 
     # ---- 低矮通道：必须踩怪才能过（跳不过去）----
     for c in range(20, 28):
         solid(c, 8)           # 天花板
-    put(19, 10, "S")          # 告示牌 2
     for c in (22, 23, 24):
         put(c, 10, "Z")
 
     # ---- 荡锤：吊在横梁上 ----
     for c in range(29, 33):
         solid(c, 7)           # 横梁
+    put(28, 10, "S")          # 告示牌 3：讲荡锤（放在锤子左边）
     put(30, 8, "H")
 
     # ---- 滑翔段：伞浮在水面上方，跳出去才够得到 ----
@@ -193,11 +201,38 @@ def check(grid, floor):
                 if below is None or below > r + 1:
                     problems.append(u"走地怪 (%d,%d) 脚下没有地面" % (c + 1, r + 1))
 
-    # 6) 刺轮不能嵌在实心里
+    # 6) 刺轮：正上方必须是实心（吊点），且臂端要扫不到站立角色
+    def ground_row_of(c):
+        r = H - 1
+        while r >= 0 and grid[r][c] != "#":
+            r -= 1
+        if r < 0:
+            return None
+        while r - 1 >= 0 and grid[r - 1][c] == "#":
+            r -= 1
+        return r
+
     for r in range(H):
         for c in range(W):
-            if grid[r][c] == "X" and grid[r][c] == "#":
-                problems.append(u"刺轮 (%d,%d) 长在实心地形里" % (c + 1, r + 1))
+            if grid[r][c] != "X":
+                continue
+            if r == 0 or grid[r - 1][c] != "#":
+                problems.append(u"刺轮 (%d,%d) 上方没有横梁，刀片像凭空浮着"
+                                % (c + 1, r + 1))
+            g = ground_row_of(c)
+            if g is None:
+                problems.append(u"刺轮 (%d,%d) 下面没有地面，是空中机关"
+                                % (c + 1, r + 1))
+                continue
+            # 轴心在格子上沿；臂端 + 尖端判定圆必须严格高于站立头顶，
+            # 否则站着跑都会被扫死 —— 这关就不可通关了。
+            arm_tip = r * TILE + ROTOR_ARM + ROTOR_TIP
+            head_top = g * TILE - PLAYER_H
+            if arm_tip >= head_top:
+                problems.append(
+                    u"刺轮 (%d,%d) 臂端 %d 够到了站立头顶 %d："
+                    u"这关会变成必死，站着跑都过不去"
+                    % (c + 1, r + 1, arm_tip, head_top))
 
     # 7) 荡锤必须吊在东西上：吊点格子正上方要是实心
     for r in range(H):
@@ -265,10 +300,13 @@ def check(grid, floor):
     return problems, widest
 
 
+# 每个元素 = 一块牌子，页用 | 分隔。牌子按地图上 S 的出现顺序（从左到右）
+# 与这里一一对应，数量对不上 world 会直接报错。
 SIGN_TEXT = [
-    u"黑团子是走地怪：从头顶落下去能踩死它，撞到侧面会死。",
+    u"黑团子是走地怪：从头顶落下去能踩死它，撞到侧面会死。|"
     u"踩死之后它闪两下就没了——每只只死一次，别回头找它。",
-    u"刺轮转得不快：等一条臂扫过去，再一口气跑过轴心。",
+    u"刀片吊在横梁下面，扫得很低。|"
+    u"贴着地横跑过去绝对安全——但只要起跳，脚一离地就会被绞进去。",
     u"荡锤看那条虚线：锤子摆到最外侧，就是你的窗口。",
 ]
 
@@ -297,10 +335,8 @@ def render(grid, floor):
     out.append(u"")
     # 牌子的文本放在地图之后：注释行不参与地图，位置在这里无所谓，
     # 顺序必须与地图里 S 的出现顺序一致
-    for i in range(0, len(SIGN_TEXT), 2):
-        a = SIGN_TEXT[i]
-        b = SIGN_TEXT[i + 1] if i + 1 < len(SIGN_TEXT) else u""
-        out.append(u";!sign %s|%s" % (a, b))
+    for page in SIGN_TEXT:
+        out.append(u";!sign %s" % page)
     out.append(u"")
     return u"\n".join(out) + u"\n"
 

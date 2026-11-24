@@ -1760,9 +1760,12 @@ def test_walker():
 
 
 def test_rotor():
-    _section(u"M7 旋转刺轮")
+    _section(u"M7 旋转刺轮（低空刀片，禁跳区）")
 
-    r = enemy.Rotor(1000.0, 600.0, phase=0.0)
+    FLOOR = 704.0
+    HEAD = FLOOR - player.Player.HEIGHT          # 站立头顶 634
+    r = enemy.Rotor(1000.0, 576.0, phase=0.0)    # 轴心取 X 格上沿
+
     arms = r.arms()
     _check(u"四臂等分", len(arms) == config.ROTOR_ARMS
            and abs(arms[1][0] - arms[0][0] - math.pi / 2) < 1e-6,
@@ -1771,6 +1774,60 @@ def test_rotor():
            all(abs(math.hypot(x - r.cx, y - r.cy) - config.ROTOR_ARM_LEN) < 0.01
                for _, x, y in arms),
            u"臂长 %.0f" % config.ROTOR_ARM_LEN)
+
+    # 几何不变式：这一条是这个机关"能不能通关"的唯一保证。
+    # 臂端一旦够到站立头顶，玩家贴着地跑也会被扫死，关卡直接不可通关。
+    arm_tip = r.cy + config.ROTOR_ARM_LEN + config.ROTOR_TIP_R
+    _check(u"臂端严格高于站立头顶（贴地跑不会被扫到）", arm_tip < HEAD,
+           u"臂端 %.0f / 头顶 %.0f，余量 %.0fpx" % (arm_tip, HEAD, HEAD - arm_tip))
+
+    # 全相位横穿：不是"运气好能过"，是 360 个相位一个都不该死
+    fails = 0
+    for k in range(360):
+        r.phase = math.radians(k)
+        r.reset()
+        x = r.cx - 90.0
+        ok = True
+        while x <= r.cx + 90.0:
+            r.update(DT)
+            if r.hits(pygame.Rect(int(x), int(HEAD), 26, player.Player.HEIGHT)):
+                ok = False
+                break
+            x += config.RUN_SPEED * DT
+        if not ok:
+            fails += 1
+    _check(u"贴地横穿 180px，360 个起始相位全部安全", fails == 0,
+           u"失败 %d 个相位" % fails)
+
+    # 但威胁必须是真的：在刀片下面起跳，会被打下来
+    jumped = hit_jump = 0
+    for k in range(72):
+        r.phase = math.radians(k * 5.0)
+        r.reset()
+        vy = config.JUMP_SPEED
+        y = HEAD
+        jumped += 1
+        for _ in range(90):
+            r.update(DT)
+            vy += (config.GRAVITY_UP if vy < 0.0 else config.GRAVITY_DOWN) * DT
+            y += vy * DT
+            if y > HEAD:
+                break
+            if r.hits(pygame.Rect(int(r.cx) - 13, int(y), 26,
+                                  player.Player.HEIGHT)):
+                hit_jump += 1
+                break
+    _check(u"原地起跳会被刀片打下来", hit_jump == jumped,
+           u"%d/%d 个相位" % (hit_jump, jumped))
+
+    # 判定必须"跟着角度走"，不能是一个固定的外接框
+    hop = pygame.Rect(int(r.cx) - 13, int(HEAD) - 40, 26, player.Player.HEIGHT)
+    r.angle = math.pi / 2
+    _check(u"臂朝下时命中跳到半空的人", r.hits(hop))
+    # 四臂十字没有"全水平"的形态，但转到 45° 时两条臂都斜在两侧，
+    # 正下方是空的 —— 这个空当必须真的能钻过去，否则就是个外接圆。
+    r.angle = math.pi / 4
+    _check(u"臂转到对角线时正下方让开", not r.hits(hop))
 
     # 远处的玩家永远安全
     far = pygame.Rect(2000, 600, 26, 70)
@@ -1781,26 +1838,12 @@ def test_rotor():
             hit_far += 1
     _check(u"离得远不会被扫到", hit_far == 0, u"%d 帧" % hit_far)
 
-    # 轴心正下方：既不能是必死（玩家没活路），也不能完全无害（等于装饰）
-    under = pygame.Rect(int(r.cx) - 13, 634, 26, 70)
+    # 逆时针：屏幕 y 向下，角度递减即视觉逆时针
     r.reset()
-    hit = 0
-    N = 900
-    for _ in range(N):
-        r.update(DT)
-        if r.hits(under):
-            hit += 1
-    ratio = hit / float(N)
-    _check(u"轴心下方是危险的但留得出窗口", 0.15 < ratio < 0.85,
-           u"命中 %.0f%%（安全窗口 %.2fs）"
-           % (ratio * 100, (1.0 - ratio) * 2 * math.pi / config.ROTOR_SPEED))
-
-    # 判定必须"跟着角度走"，不能是一个固定的外接框
-    r.angle = 0.0
-    side = pygame.Rect(int(r.cx) - 13, 634, 26, 70)
-    _check(u"臂正对下方时命中", r.hits(side))
-    r.angle = math.pi / 4
-    _check(u"臂转到对角线时让开", not r.hits(side))
+    a0 = r.angle
+    r.update(0.2)
+    _check(u"逆时针旋转", r.angle < a0,
+           u"%.3f → %.3f" % (a0, r.angle))
 
 
 def test_pendulum():
@@ -1939,16 +1982,33 @@ def test_m7_scene(app):
            scene.deaths == 1 and u"走地怪" in scene.last_death_cause,
            u"死亡 %d 次，原因「%s」" % (scene.deaths, scene.last_death_cause))
 
-    # ---- 刺轮扫死 ----
+    # ---- 刺轮：贴地跑过是安全的，跳起来才挨 ----
     scene.restart()
     rot = w.rotors[0]
-    scene.player.teleport(rot.cx - W * 0.5, 11 * config.TILE - H)
+    scene.player.teleport(rot.cx - 120 - W * 0.5, 11 * config.TILE - H)
     scene.invuln = 0.0
+    scene.override_axis = 1.0
     frames = 0
-    while not scene.deaths and frames < 400:
+    while scene.player.x < rot.cx + 70 and frames < 400:
         scene.update(DT)
         frames += 1
-    _check(u"站在刺轮下面会被扫死",
+    scene.override_axis = None
+    _check(u"贴地从刀片下方跑过去不会死", scene.deaths == 0,
+           u"%d 帧跑到 x=%.0f，死亡 %d 次：%s"
+           % (frames, scene.player.x, scene.deaths, scene.last_death_cause))
+
+    # 同一位置换成"跳着过"：这是它唯一该杀人的方式
+    scene.restart()
+    scene.player.teleport(rot.cx - W * 0.5, 11 * config.TILE - H)
+    scene.invuln = 0.0
+    scene.input.jump_pressed = True
+    scene.input.jump_held = True
+    frames = 0
+    while not scene.deaths and frames < 200:
+        scene.update(DT)
+        frames += 1
+    scene.input.jump_held = False
+    _check(u"在刀片下面起跳会被打下来",
            scene.deaths == 1 and u"刀片" in scene.last_death_cause,
            u"%d 帧（%.1fs）后死亡：「%s」"
            % (frames, frames * DT, scene.last_death_cause))

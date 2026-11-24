@@ -760,7 +760,9 @@ class World(object):
             self.walkers.append(
                 enemy.Walker(left, right, ground, phase=(0.37 * i) % 1.0))
         # M7：旋转刺轮与荡锤。相位按列号错开，免得一排机关同步得像节拍器。
-        self.rotors = [enemy.Rotor(c * tile + tile // 2, r * tile + tile // 2,
+        # 刺轮轴心取 X 格的**顶边**（和荡锤一样吊在梁底）：只有把轴心抬到
+        # 头顶以上，臂才能短到"站着扫不到、跳起来才挨"。
+        self.rotors = [enemy.Rotor(c * tile + tile // 2, r * tile,
                                    phase=((c * 0.53 + r * 0.29) % 2.0))
                        for c, r in parsed.rotors]
         # 荡锤的吊点取 H 格的**顶边**：地图里 H 必须写在横梁正下方，
