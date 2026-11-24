@@ -389,6 +389,10 @@ class GameScene(Scene):
         self.goal_reached = False
         self.load_error = ""
         self.level_path = path
+        # 换关 = 从头开始：死亡定格、检查点、统计都得清掉。少了这一句，
+        # 上一关死在一半时切关，新关会带着旧关的死亡定格（开头冻半秒）
+        # 和旧关的检查点开跑——_respawn 甚至会把角色传回上一关的坐标。
+        self._reset_stats()
         try:
             self.world = world.World.load(path)
         except world.LevelError as exc:

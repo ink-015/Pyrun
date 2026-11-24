@@ -1901,6 +1901,11 @@ def test_m7_parse():
     _check(u"2 个篝火", len(w.checkpoints) == 2,
            u"%d 个：%s" % (len(w.checkpoints),
                           [c["col"] for c in w.checkpoints]))
+    # 索引必须等于"跑到的先后"。老版本按地图行序排：水池前那盏在天上第 8 行、
+    # 荡锤前那盏贴地第 10 行，于是右边那盏排到了左边那盏前面，点亮顺序一乱，
+    # "只允许往关卡后面点亮"的规则就把水池前那盏永久封死了。
+    cols = [c["col"] for c in w.checkpoints]
+    _check(u"篝火按列升序排列（= 跑到的先后）", cols == sorted(cols), u"%s" % cols)
 
     # 刺轮是"禁跳区"，玩家在它下面本来就没有跳的需求；必须有一只走地怪
     # 把这条道占住，刀片才有意义。
@@ -1948,11 +1953,10 @@ def test_m7_parse():
     _check(u"伞悬在岸面上方 1~2 格",
            ledge is not None and 0 < ledge - it["rect"].bottom <= 2 * config.TILE,
            u"伞底边 %d，岸面 %s" % (it["rect"].bottom, ledge))
-    _check(u"伞脚下一格是水（没地方站）",
-           w.cell_at_px(it["rect"].centerx,
-                        it["rect"].bottom + config.TILE) == "~",
-           w.cell_at_px(it["rect"].centerx,
-                        it["rect"].bottom + config.TILE))
+    _check(u"伞悬在水面上（脚下没有落脚点）",
+           w.ground_y_below(it["rect"].centerx, it["rect"].bottom + 2) is None,
+           u"脚下地面 %s"
+           % w.ground_y_below(it["rect"].centerx, it["rect"].bottom + 2))
     # 站在岸边（最后一格）够不到：判定区在水的正上方，只靠走是拿不到的
     stand = pygame.Rect(col * config.TILE - player.Player.WIDTH,
                         (ledge or 0) - player.Player.HEIGHT,
@@ -2082,6 +2086,37 @@ def test_m7_air_glider(app):
         _check(u"l5 可加载", False, scene.load_error)
         return
 
+    # 伞挂在"跳满才够到"的高度上：判定区底边离岸面正好 2 格。
+    # 这条是玩家的反馈——原来挂在 1 格，点一下跳就拿到了，于是玩家学会了
+    # "跳一下"，然后在坑边被水吞掉：他根本不知道自己需要跳满。
+    it = w.gliders[0]
+    _check(u"伞的判定区底边在岸面往上 2 格",
+           it["rect"].bottom == 9 * config.TILE - 2 * config.TILE,
+           u"底边 %d，岸面 %d" % (it["rect"].bottom, 9 * config.TILE))
+
+    # 低跳拿不到：按住 4 帧就松手（JUMP_CUT 会切掉上升速度），跳到一半
+    scene.player.teleport(56 * config.TILE - player.Player.WIDTH,
+                          9 * config.TILE - player.Player.HEIGHT)
+    scene.override_axis = 1.0
+    scene.input.jump_held = True
+    scene.input.jump_pressed = True
+    for i in range(30):
+        if i == 4:
+            scene.input.jump_held = False
+            scene.input.jump_released = True
+        scene.update(DT)
+    _check(u"点一下跳（低跳）拿不到伞", not scene.player.has_glider,
+           u"has_glider=%s y=%.0f" % (scene.player.has_glider, scene.player.y))
+
+    # 低跳这一趟大概率已经掉进水里记了一次死亡，重新载一次关，
+    # 后面的"一跳到底"要在干净的计数上跑。
+    scene.input.jump_held = False
+    scene.load_level(L5)
+    w = scene.world
+    if w is None:
+        _check(u"l5 可加载", False, scene.load_error)
+        return
+
     # 从岸上跳出去：伞在水面上方，必须靠跳（而不是走过去）拿
     scene.player.teleport(56 * config.TILE - player.Player.WIDTH,
                           9 * config.TILE - player.Player.HEIGHT)
@@ -2187,6 +2222,29 @@ def test_m7_checkpoint(app):
     _run(scene, 90)
     _check(u"站在篝火旁边不会被动到", scene.deaths == 1,
            u"死亡 %d 次：「%s」" % (scene.deaths, scene.last_death_cause))
+
+    # ---- 第二盏（水池前）必须也能点亮 ----
+    # 这就是玩家报的那个"滑翔伞前的火堆不触发"：篝火列表按地图行序排，
+    # 水池前那盏（更靠右）的索引反而更小，点亮荡锤前那盏之后就再也点不亮它。
+    cp2 = cps[1]
+    scene.player.teleport(cp2["spawn"][0], cp2["spawn"][1])
+    _run(scene, 2)
+    _check(u"水池前那盏篝火也能点亮", cp2["active"],
+           u"active=%s，索引 %d" % (cp2["active"], scene.checkpoint_index))
+    _check(u"点亮后重生点挪到水池前", scene.checkpoint == cp2["spawn"],
+           u"checkpoint=%s，期望 %s" % (scene.checkpoint, cp2["spawn"]))
+
+    deaths_before = scene.deaths
+    scene.invuln = 0.0
+    scene.player.teleport(59 * config.TILE, 9 * config.TILE - player.Player.HEIGHT)
+    frames = 0
+    while scene.deaths == deaths_before and frames < 200:
+        scene.update(DT)
+        frames += 1
+    _run(scene, int(config.DEATH_FREEZE / DT) + 3)
+    _check(u"掉进水池会回水池前的篝火", 
+           abs(scene.player.x - cp2["spawn"][0]) < 1.0,
+           u"x=%.0f，篝火 x=%d" % (scene.player.x, cp2["spawn"][0]))
 
 
 # ---------------------------------------------------------------- 入口

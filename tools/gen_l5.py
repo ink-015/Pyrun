@@ -108,11 +108,15 @@ def build():
     put(28, 10, "S")          # 告示牌 3：讲荡锤（放在锤子左边）
     put(30, 8, "H")
 
-    # ---- 滑翔段：伞浮在水面上方，跳出去才够得到 ----
+    # ---- 滑翔段：伞吊在"跳满"的那个高度上，而不是贴着水面 ----
     for c in range(57, 62):
         for r in range(9, H):
             put(c, r, "~")
-    put(57, 7, "G")
+    # 伞原来放在第 7 行（判定区底边离岸面 64px），点一下跳就拿到了，
+    # 于是玩家学会了"跳一下"，然后在坑边被水流吞掉——因为他根本不知道自己
+    # 需要跳满。现在抬到第 6 行：判定区底边 = 岸面往上 128px，正好是跳满时的
+    # 头顶位置。想拿伞就必须按住空格跳最高，而这个动作正是滑过水池需要的。
+    put(57, 6, "G")
 
     # ---- 终点与封口 ----
     put(64, 8, "F")
@@ -128,8 +132,15 @@ def build():
     # ---- 金币 ----
     # 14 / 18 列原本是地面金币，现在正好落在走地怪的巡逻线上（会被怪踩过去），
     # 挪到巡逻段两头：玩家要拿就得在那里起跳——那两处是刀片够不到的。
+    #
+    # 滑翔段的金币是"软引导"：起跳点正上方一枚（第 56 列两枚叠成一个向上的
+    # 指示），伞后面顺着下滑轨迹摆两枚，对岸落点一枚。玩家跟着金币走，走的
+    # 就是"跳满 → 一直按住空格滑过去"这条唯一能过水池的路线。
+    # 原来 59 列那枚在水面上方 64px，比滑翔轨迹低一截：想去够只能松开空格
+    # 往下掉，那不是引导，是拿金币骗人跳水。
     for c, r in ((6, 10), (10, 9), (12, 10), (19, 9), (26, 10),
-                 (33, 10), (40, 8), (46, 8), (52, 8), (56, 8), (59, 8)):
+                 (33, 10), (40, 8), (46, 8), (52, 8),
+                 (56, 8), (56, 6), (58, 7), (60, 7), (62, 8)):
         put(c, r, "c")
 
     return grid, floor
@@ -268,27 +279,41 @@ def check(grid, floor):
                     problems.append(u"荡锤 (%d,%d) 上方没有横梁，锤子像凭空吊着"
                                     % (c + 1, r + 1))
 
-    # 8) 滑翔伞：不在实心里，且底部离最近站立面 ≤2 格（跳得到）
+    # 8) 滑翔伞：必须挂在"跳满才够到"的高度上
+    #    不直接量像素高度，而是拿站立头顶和跳满时的头顶当上下界：
+    #    低了就退化成"点一下跳就拿到"（玩家学不会他真正需要的动作），
+    #    高了就变成"这关拿不到伞"。两头都是设计事故。
     for r in range(H):
         for c in range(W):
             if grid[r][c] != "G":
                 continue
-            if grid[r][c] == "#":
-                problems.append(u"滑翔伞 (%d,%d) 埋在实心里" % (c + 1, r + 1))
             support = None
             for cc in (c - 1, c, c + 1):
+                # 伞悬在水面上，脚下那格没有地面，落点取左右两格里最高的那个
                 if 0 <= cc < W:
                     f = floor_row(cc)
                     if f is not None and f > r:
                         if support is None or f < support:
                             support = f
-            bottom = (r + 1) * TILE
             if support is None:
                 problems.append(u"滑翔伞 (%d,%d) 下方没有任何落点" % (c + 1, r + 1))
-            elif support * TILE - bottom > 2 * TILE:
+                continue
+            bottom = (r + 1) * TILE
+            ground = support * TILE
+            stand_top = ground - PLAYER_H          # 站着时的头顶
+            apex_top = stand_top - JUMP_RISE       # 跳满时的头顶
+            # 下界：不能"随便点一下就够到"
+            if bottom > stand_top - 0.4 * JUMP_RISE:
                 problems.append(
-                    u"滑翔伞 (%d,%d) 离地 %.0fpx，跳不到（跳高 %.0fpx）"
-                    % (c + 1, r + 1, support * TILE - bottom, JUMP_RISE))
+                    u"滑翔伞 (%d,%d) 判定区底边 %d 离站立头顶 %d 太近："
+                    u"点一下跳就拿到了，玩家学不会「跳满再滑」"
+                    % (c + 1, r + 1, bottom, stand_top))
+            # 上界：跳满时身体要进得去（留 6px 余量，别做成像素级完美）
+            if bottom < apex_top + 6:
+                problems.append(
+                    u"滑翔伞 (%d,%d) 判定区底边 %d 高过跳满时的头顶 %d："
+                    u"这关根本拿不到伞"
+                    % (c + 1, r + 1, bottom, apex_top))
 
     # 9) 出生点与终点
     spawns = sum(line.count("P") for line in rows)
@@ -399,6 +424,51 @@ def check(grid, floor):
                 u"走地怪 %d-%d 列一个来回要 %.1f 秒，玩家只能站着等"
                 % (c0 + 1, c1 + 1, cycle))
 
+    # 15) 水面上的金币必须躺在滑翔轨迹上。
+    #     这一条是被玩家怼出来的：原来水面上方 64px 有一枚金币，比滑翔轨迹
+    #     低一截——想去够只能松开空格往下掉，那不是引导，是拿金币骗人跳水。
+    #     判据用真实参数把轨迹算一遍：从岸沿起跳、跳满、然后一直按住空格，
+    #     看金币格子有没有和"身体扫过的那条带子"相交。差一格也算不合格。
+    t_apex = JUMP_V / (G_UP * HOLD)
+    run_reach = RUN_SPEED * t_apex
+
+    def body_at(dx):
+        """离岸沿 dx 时身体的 (top, bottom)，以起跳岸面为 0、向上为负。"""
+        if dx <= run_reach:
+            t = dx / RUN_SPEED
+            bottom = -(JUMP_V * t - 0.5 * G_UP * HOLD * t * t)
+        else:
+            bottom = -JUMP_RISE + GLIDE_FALL * (dx - run_reach) / GLIDE_SPEED
+        return bottom - PLAYER_H, bottom
+
+    for r in range(H):
+        for c in range(W):
+            if grid[r][c] != "c" or floor_row(c) is not None:
+                continue                    # 岸上的金币，走过去就拿到，不查
+            g0 = c
+            while g0 - 1 >= 0 and floor_row(g0 - 1) is None:
+                g0 -= 1
+            if g0 == 0:
+                continue
+            ledge = floor_row(g0 - 1)
+            x_take = g0 * TILE
+            cx0, cx1 = c * TILE, (c + 1) * TILE
+            hit = False
+            dx = 0.0
+            while dx <= 400.0:
+                # 身体的水平范围 [x_take+dx-W, x_take+dx] 与金币格子相交？
+                if x_take + dx > cx0 and x_take + dx - PLAYER_W < cx1:
+                    top, bottom = body_at(dx)
+                    if (ledge * TILE + bottom > r * TILE
+                            and ledge * TILE + top < (r + 1) * TILE):
+                        hit = True
+                        break
+                dx += 2.0
+            if not hit:
+                problems.append(
+                    u"水面金币 (%d,%d) 不在滑翔轨迹上：玩家为了够它只能松手往下掉"
+                    % (c + 1, r + 1))
+
     return problems, widest
 
 
@@ -463,8 +533,8 @@ def main():
         return 1
 
     print(u"检查全部通过：矩形、图例、坑宽、台阶、走地怪落脚与巡逻周期、"
-          u"刺轮位置与下方巡逻联动、吊点、伞可达性、出生/终点、滑翔射程、"
-          u"篝火落脚与重生点安全性")
+          u"刺轮位置与下方巡逻联动、吊点、伞的悬挂高度、出生/终点、滑翔射程、"
+          u"水面金币是否在滑翔轨迹上、篝火落脚与重生点安全性")
 
     path = os.path.join(ROOT, "levels", "l5.txt")
     if "--write" in sys.argv:

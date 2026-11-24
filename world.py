@@ -691,9 +691,15 @@ class World(object):
                                              tile - 8, 8))
 
         # ---- 篝火检查点 ----
+        # 必须按"跑到它的先后"（列坐标）排，不能按地图文件的行序。
+        # 解析器是自上而下扫地图的：第 5 关水池前那盏在天空开阔的第 8 行，
+        # 荡锤前那盏在贴地的第 10 行，于是列表里右边那盏排在左边那盏前面。
+        # 而点亮规则是"只允许往关卡后面走"（idx > checkpoint_index），
+        # 索引一颠倒，点亮荡锤前那盏之后，水池前那盏就永远点不亮了——
+        # 玩家要等死了才发现自己没存上档。
         bw, bh = config.CHECKPOINT_BOX
         self.checkpoints = []
-        for c, r in parsed.checkpoints:
+        for c, r in sorted(parsed.checkpoints):
             self.checkpoints.append({
                 "col": c, "row": r,
                 "rect": pygame.Rect(c * tile + (tile - bw) // 2,

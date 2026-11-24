@@ -597,21 +597,35 @@ def main():
               % (ham.px, ham.py, bx, by, math.degrees(ham.angle)))
         print(" 截图   :", save_screenshot(screen, "m7_hammer.png"))
 
-        # 4) 半空中的伞：从岸上跳出去，靠"跳"而不是"走"拿到它
+        # 4) 半空中的伞：伞挂在"跳满"的那个高度上，金币一路引到伞边。
+        #    这一张要停在**碰到伞之前**——捡起来之后伞就没了，画面里只剩人
+        #    在空中，看不出"伞在这个高度"这件事。
         scene.invuln = 0.0
         p.teleport(56 * config.TILE - W, 9 * config.TILE - H)
         p.has_glider = False
+        for it in scene.world.gliders:
+            it["taken"] = False
         scene.camera.snap_to(p.rect)
         scene.override_axis = 1.0
         scene.input.jump_held = True
         scene.input.jump_pressed = True
-        for _ in range(46):
+        for _ in range(15):
             app.scenes.update(config.FIXED_DT)
         app.scenes.draw(screen)
         pygame.display.flip()
-        print(u" 空中道具 : 伞=%s 滑翔中=%s  x=%.0f（水坑 57~61 列）vy=%.0f"
-              % (p.has_glider, p.gliding, p.x, p.vy))
+        print(u" 空中道具 : 起跳弧顶点附近 y=%.0f（站立时 %d，伞底边 %d）"
+              % (p.y, 9 * config.TILE - H,
+                 scene.world.gliders[0]["rect"].bottom))
         print(" 截图   :", save_screenshot(screen, "m7_glider.png"))
+
+        # 接着跑完这一段，确认伞拿得到、也滑得过去
+        for _ in range(40):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 滑翔     : 伞=%s 滑翔中=%s x=%.0f（水坑 57~61 列）vy=%.0f"
+              % (p.has_glider, p.gliding, p.x, p.vy))
+        print(" 截图   :", save_screenshot(screen, "m7_glide.png"))
         pygame.quit()
         return 0
 
