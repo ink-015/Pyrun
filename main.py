@@ -18,6 +18,7 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-death   触发一次落水死亡，截下死亡定格画面
     python main.py --smoke-glide   第 3 关：先走过去捡伞，再抓一张滑翔中的画面
     python main.py --smoke-m6      第 4 关：NPC 对话 / 蝙蝠走廊 / 落石三张图
+    python main.py --smoke-m7      第 5 关：踩怪 / 刺轮 / 荡锤 / 空中伞四张图
     python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -521,6 +522,95 @@ def main():
               % (len(scene.world.rocks),
                  falling.state if falling else u"无", scene.world.rock_count))
         print(" 截图   :", save_screenshot(screen, "m6_rock.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-m7" in sys.argv:
+        # M7：四张图——踩怪、刺轮、荡锤、半空中的伞
+        app.level_path = os.path.join(config.LEVEL_DIR, "l5.txt")
+        app.scenes.start("game")
+        scene = app.scenes.current
+        p = scene.player
+        scene.show_debug = False
+        W = player.Player.WIDTH
+        H = player.Player.HEIGHT
+
+        # 1) 踩怪：从走地怪头顶正上方掉下去，抓"闪烁消失"的那一帧。
+        #    这里刻意不开无敌——踩中判定只在 invuln<=0 时才会走。
+        wk = scene.world.walkers[0]
+        p.teleport(wk.cx - W * 0.5, wk.ground_y - 3 - 26 - H - 46)
+        scene.camera.snap_to(p.rect)
+        for _ in range(2):
+            app.scenes.update(config.FIXED_DT)
+        scene.override_axis = 0.0
+        for _ in range(12):
+            app.scenes.update(config.FIXED_DT)
+            if p.stomp_count:
+                break
+        # 停在"还看得见"的那一闪上：闪烁是按 die_t 取模的，早两帧晚两帧
+        # 就拍到空了，所以循环到可见帧为止再画。
+        for _ in range(10):
+            if int(wk.die_t * config.WALKER_DIE_FLICKER) % 2 == 1:
+                break
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 踩怪     : 踩中 %d 次，走地怪状态 %s，vy=%.0f（应为负）"
+              % (p.stomp_count, wk.state, p.vy))
+        print(" 截图   :", save_screenshot(screen, "m7_stomp.png"))
+
+        # 2) 刺轮：站在危险范围外等，抓一条臂正对下方的帧（最有压迫感的一张）。
+        #    站在扫掠圈外而不是里面：无敌闪烁会让角色隔帧不画，截图里就没人了。
+        scene.override_axis = 0.0
+        rot = scene.world.rotors[0]
+        p.teleport(rot.cx - 104 - W * 0.5, 704 - H)
+        scene.invuln = 0.0
+        scene.camera.snap_to(p.rect)
+        best = None
+        for _ in range(200):
+            app.scenes.update(config.FIXED_DT)
+            down = abs(((rot.angle % (2 * math.pi)) - math.pi / 2))
+            if down > math.pi:
+                down = 2 * math.pi - down
+            if best is None or down < best:
+                best = down
+                app.scenes.draw(screen)
+            if down < 0.06:
+                break
+        pygame.display.flip()
+        print(u" 刺轮     : 臂长 %.0f，周期 %.2fs，当前角 %.0f°"
+              % (config.ROTOR_ARM_LEN, 2 * math.pi / config.ROTOR_SPEED,
+                 math.degrees(rot.angle) % 360))
+        print(" 截图   :", save_screenshot(screen, "m7_rotor.png"))
+
+        # 3) 荡锤：站在摆幅外侧（锤子扫不到的位置），画面里同时有梁、链、球
+        ham = scene.world.hammers[0]
+        p.teleport(ham.px + config.PENDULUM_ARM + 24, 704 - H)
+        scene.camera.snap_to(p.rect)
+        for _ in range(40):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        bx, by = ham.bob()
+        print(u" 荡锤     : 吊点 (%.0f, %.0f)，锤心 (%.0f, %.0f)，摆角 %.0f°"
+              % (ham.px, ham.py, bx, by, math.degrees(ham.angle)))
+        print(" 截图   :", save_screenshot(screen, "m7_hammer.png"))
+
+        # 4) 半空中的伞：从岸上跳出去，靠"跳"而不是"走"拿到它
+        scene.invuln = 0.0
+        p.teleport(56 * config.TILE - W, 9 * config.TILE - H)
+        p.has_glider = False
+        scene.camera.snap_to(p.rect)
+        scene.override_axis = 1.0
+        scene.input.jump_held = True
+        scene.input.jump_pressed = True
+        for _ in range(46):
+            app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 空中道具 : 伞=%s 滑翔中=%s  x=%.0f（水坑 57~61 列）vy=%.0f"
+              % (p.has_glider, p.gliding, p.x, p.vy))
+        print(" 截图   :", save_screenshot(screen, "m7_glider.png"))
         pygame.quit()
         return 0
 

@@ -70,6 +70,34 @@ def ufo_image():
     return _UFO_IMG or None
 
 
+# ---------------------------------------------------------------- 几何工具
+
+def _rect_circle(rect, cx, cy, r):
+    """矩形与圆是否相交。采样碰撞要用几十次，比自己拼 Rect 便宜也准。"""
+    nx = min(max(cx, rect.left), rect.right)
+    ny = min(max(cy, rect.top), rect.bottom)
+    dx = cx - nx
+    dy = cy - ny
+    return dx * dx + dy * dy <= r * r
+
+
+def _dashed_arc(surface, color, cx, cy, radius, a0, a1, steps=18, dash=2):
+    """沿圆弧画一串短点，用作"这块地方会被扫到"的淡提示。
+
+    不用 pygame.draw.arc：它只能描边，而且 1.9.6 上角度单位与粗细都很难对齐；
+    点阵在纸面风格里反而更像用铅笔轻轻圈了一下。
+    """
+    if steps <= 0:
+        return
+    for i in range(steps + 1):
+        if i % 2 == 0:
+            continue
+        a = a0 + (a1 - a0) * i / float(steps)
+        x = int(cx + math.cos(a) * radius)
+        y = int(cy + math.sin(a) * radius)
+        pygame.draw.circle(surface, color, (x, y), dash)
+
+
 # ---------------------------------------------------------------- 绘制工具
 
 def _dashed_vline(surface, color, x, y0, y1, dash=8, gap=6, width=1):
@@ -378,3 +406,351 @@ class RockSpawner(object):
         for i, dx in enumerate((-6, 0, 7)):
             pygame.draw.line(surface, (150, 144, 134),
                              (cx + dx, y + 1), (cx + dx + 2, y + 9 + i % 2 * 3), 2)
+
+
+# ---------------------------------------------------------------- 走地怪
+
+class Walker(object):
+    """在地上左右走的小怪物，可以从头顶踩死。
+
+    和蝙蝠的差别不是"能杀 / 不能杀"，而是**玩家有没有主动权**：
+    蝙蝠在你头顶飞来飞去，你只能等；走地怪在路上来回走，你可以等它转身，
+    也可以主动跳上去把它踩掉。两条路都成立，这一段才有得选。
+
+    素材包里没有走地怪，它完全由代码画：一个墨色团子 + 两条腿 + 两只眼。
+    纸面手绘风里"实心墨团"是最容易一眼认出的形状，比贴一张卡通图更统一。
+    """
+
+    def __init__(self, left_px, right_px, ground_y, phase=0.0):
+        self.left = float(left_px)
+        self.right = float(right_px)
+        if self.right - self.left < 1.0:
+            # 只有一个格子：给它 ±24px 的来回，否则玩家会以为它是块石头
+            self.left = left_px - config.WALKER_SOLO_PATROL
+            self.right = left_px + config.WALKER_SOLO_PATROL
+        self.cx = (self.left + self.right) * 0.5
+        self.ground_y = float(ground_y)
+        self.dir = 1
+        self.t = phase
+        self.anim = 0.0
+        self.state = "walk"        # walk / dying / gone
+        self.die_t = 0.0
+
+    # ---- 运行期 ----
+    def reset(self):
+        self.cx = (self.left + self.right) * 0.5
+        self.dir = 1
+        self.t = 0.0
+        self.anim = 0.0
+        self.state = "walk"
+        self.die_t = 0.0
+
+    @property
+    def alive(self):
+        return self.state == "walk"
+
+    def update(self, dt, player=None):
+        self.t += dt
+        if self.state == "dying":
+            self.die_t += dt
+            if self.die_t >= config.WALKER_DIE_TIME:
+                self.state = "gone"
+            return None
+        if self.state == "gone":
+            return None
+        self.anim += dt * config.WALKER_STEP_FPS
+        self.cx += self.dir * config.WALKER_SPEED * dt
+        if self.cx >= self.right:
+            self.cx = self.right
+            self.dir = -1
+        elif self.cx <= self.left:
+            self.cx = self.left
+            self.dir = 1
+        return None
+
+    def hitbox(self):
+        """活着才有判定。踩死之后立刻返回 None，同一帧不会再被算一次碰撞。"""
+        if not self.alive:
+            return None
+        w, h = config.WALKER_HITBOX
+        return pygame.Rect(int(self.cx - w * 0.5),
+                           int(self.ground_y - 3 - h), w, h)
+
+    def stomp_zone(self):
+        """可被踩中的区域：判定框上半部分（见 config.STOMP_TOP_RATIO）。"""
+        if not self.alive:
+            return None
+        box = self.hitbox()
+        h = int(box.height * config.STOMP_TOP_RATIO)
+        return pygame.Rect(box.x, box.y, box.width, h)
+
+    def stomp(self):
+        """被踩。返回是否真的踩到了（已经死了返回 False）。"""
+        if not self.alive:
+            return False
+        self.state = "dying"
+        self.die_t = 0.0
+        return True
+
+    def draw(self, surface, ox, oy):
+        if self.state == "gone":
+            return
+        cx = int(self.cx) + ox
+        feet = int(self.ground_y) + oy
+
+        # 死亡：闪烁 + 整体缩一点。闪而不淡出，是因为纸底上的半透明墨团
+        # 看起来像"糊了一块"，闪两下消失才读得出"它被打没了"。
+        scale = 1.0
+        if self.state == "dying":
+            if int(self.die_t * config.WALKER_DIE_FLICKER) % 2 == 0:
+                return
+            scale = 1.0 - 0.45 * (self.die_t / max(1e-6, config.WALKER_DIE_TIME))
+
+        bw = config.WALKER_BODY_W * scale
+        bh = config.WALKER_BODY_H * scale
+        gait = math.sin(self.anim * math.pi * 2.0) if self.alive else 0.0
+        body_cy = feet - 9 - bh * 0.5 + abs(gait) * 1.5
+
+        # 腿：两条短墨线，前后摆
+        for side, off in ((-1, gait), (1, -gait)):
+            hip_x = cx + side * 7 * scale
+            pygame.draw.line(surface, config.COLOR_INK,
+                             (hip_x, int(body_cy + bh * 0.4)),
+                             (int(hip_x + off * 5.0), feet - 1), 3)
+
+        # 身体：一个底部略扁的墨团 + 两根小角
+        rect = pygame.Rect(0, 0, int(bw), int(bh))
+        rect.center = (cx, int(body_cy))
+        pygame.draw.ellipse(surface, (58, 55, 52), rect)
+        pygame.draw.ellipse(surface, config.COLOR_INK, rect, 2)
+        for side in (-1, 1):
+            tipx = cx + side * int(bw * 0.28)
+            tipy = rect.top - 6 * scale
+            pygame.draw.line(surface, config.COLOR_INK,
+                             (cx + side * int(bw * 0.16), rect.top + 2),
+                             (tipx, tipy), 2)
+
+        if self.state == "dying":
+            # 消失前给一个"×"：踩死和"走到一半卡住了"必须区分得开
+            pygame.draw.line(surface, (255, 255, 255),
+                             (cx - 7, rect.centery - 7), (cx + 7, rect.centery + 7), 2)
+            pygame.draw.line(surface, (255, 255, 255),
+                             (cx + 7, rect.centery - 7), (cx - 7, rect.centery + 7), 2)
+            return
+
+        # 眼睛：两只白点，瞳孔朝行进方向。看得见朝向，才数得清它什么时候转身
+        for side in (-1, 1):
+            ex = cx + side * 6 + self.dir * 2
+            pygame.draw.circle(surface, (255, 255, 255), (int(ex), int(body_cy - 4)), 4)
+            pygame.draw.circle(surface, config.COLOR_INK,
+                               (int(ex + self.dir * 1.5), int(body_cy - 4)), 2)
+
+
+# ---------------------------------------------------------------- 旋转刺轮
+
+class Rotor(object):
+    """绕轴匀速转的十字刀片。
+
+    这是本作第一个"靠碰撞检测本身构成难度"的机关：它没有状态机，只有角度。
+    玩家要做的事情是**读懂转速**——四臂十字每过 90° 是一个窗口，
+    1.9rad/s 下窗口间隔 0.83 秒，够跑过去，但只要犹豫一步就得等下一轮。
+
+    判定用"沿臂采样小圆"而不是画一个旋转的大判定框：外接圆会让四个角变成
+    隐形墙，玩家明明从臂缝里钻过去却被判死，那是最没道理的一种冤。
+    """
+
+    def __init__(self, cx, cy, phase=0.0):
+        self.cx = float(cx)
+        self.cy = float(cy)
+        self.phase = phase
+        self.t = 0.0
+        self.angle = phase
+        self._sweep = None
+
+    # ---- 运行期 ----
+    def reset(self):
+        self.t = 0.0
+        self.angle = self.phase
+
+    def _sweep_surface(self):
+        """扫掠范围底图：一层极淡的红 + 一圈虚线。
+
+        缓存成一张小图。每帧新建一个 SRCALPHA Surface 再画圆，四臂机关
+        一多就会在帧预算里占出可见的一块；底图是不动的，画一次就够。
+        """
+        if self._sweep is not None:
+            return self._sweep
+        r = int(config.ROTOR_ARM_LEN) + 5
+        surf = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
+        c = (r + 1, r + 1)
+        pygame.draw.circle(surf, (247, 201, 190, 30), c, r - 3)
+        for i in range(0, 360, 10):
+            a = math.radians(i)
+            x = int(c[0] + math.cos(a) * (r - 2))
+            y = int(c[1] + math.sin(a) * (r - 2))
+            pygame.draw.circle(surf, (214, 168, 160, 210), (x, y), 2)
+        self._sweep = surf
+        return surf
+
+    def update(self, dt, player=None):
+        self.t += dt
+        self.angle = self.phase + self.t * config.ROTOR_SPEED
+        return None
+
+    def hitbox(self):
+        # 没有单一判定框：形状是四条会转的线
+        return None
+
+    def arms(self):
+        """四条臂的末端坐标，绘制与判定共用同一份角度。"""
+        out = []
+        for i in range(config.ROTOR_ARMS):
+            a = self.angle + i * 2.0 * math.pi / config.ROTOR_ARMS
+            out.append((a, self.cx + math.cos(a) * config.ROTOR_ARM_LEN,
+                        self.cy + math.sin(a) * config.ROTOR_ARM_LEN))
+        return out
+
+    def hits(self, rect):
+        r = config.ROTOR_ARM_THICK * 0.5
+        step = config.ROTOR_SAMPLE_STEP
+        for a, ex, ey in self.arms():
+            # 从轴心往外采样。起点跳过轴心附近：那里是轮毂，给一点容错，
+            # 也让"贴着轴心站着"不会因为一次采样就被判死。
+            s = float(config.ROTOR_HUB_R + 4)
+            while s < config.ROTOR_ARM_LEN - 2.0:
+                if _rect_circle(rect, self.cx + math.cos(a) * s,
+                                self.cy + math.sin(a) * s, r):
+                    return True
+                s += step
+            if _rect_circle(rect, ex, ey, config.ROTOR_TIP_R):
+                return True
+        return False
+
+    def draw(self, surface, ox, oy):
+        cx = int(self.cx) + ox
+        cy = int(self.cy) + oy
+
+        # 扫掠范围：淡红圆 + 虚线圈。第一次见的人靠它才知道"这东西会转到
+        # 我站的地方"，否则只能站在原地等它转一圈才敢动。
+        sweep = self._sweep_surface()
+        surface.blit(sweep, (cx - sweep.get_width() // 2,
+                             cy - sweep.get_height() // 2))
+
+        for a, ex, ey in self.arms():
+            dx, dy = math.cos(a), math.sin(a)
+            px, py = -dy, dx
+            # 刀片：从轴心往外收窄的多边形，比一条等宽直线更像"刃"
+            r0 = config.ROTOR_HUB_R - 1
+            w0 = config.ROTOR_ARM_THICK * 0.5
+            w1 = 2.0
+            pts = [
+                (cx + dx * r0 + px * w0, cy + dy * r0 + py * w0),
+                (cx + dx * config.ROTOR_ARM_LEN + px * w1,
+                 cy + dy * config.ROTOR_ARM_LEN + py * w1),
+                (cx + dx * config.ROTOR_ARM_LEN - px * w1,
+                 cy + dy * config.ROTOR_ARM_LEN - py * w1),
+                (cx + dx * r0 - px * w0, cy + dy * r0 - py * w0),
+            ]
+            pts = [(int(x), int(y)) for x, y in pts]
+            pygame.draw.polygon(surface, (92, 88, 82), pts)
+            pygame.draw.polygon(surface, config.COLOR_INK, pts, 2)
+
+            # 尖端三角刺：比刀身宽一圈，远远看过去是四个"尖"
+            tipx = cx + dx * config.ROTOR_ARM_LEN
+            tipy = cy + dy * config.ROTOR_ARM_LEN
+            tri = [
+                (int(tipx + px * 5), int(tipy + py * 5)),
+                (int(tipx + dx * 11), int(tipy + dy * 11)),
+                (int(tipx - px * 5), int(tipy - py * 5)),
+            ]
+            pygame.draw.polygon(surface, config.COLOR_DANGER, tri)
+            pygame.draw.polygon(surface, config.COLOR_INK, tri, 2)
+
+        pygame.draw.circle(surface, (120, 116, 110), (cx, cy), config.ROTOR_HUB_R)
+        pygame.draw.circle(surface, config.COLOR_INK, (cx, cy), config.ROTOR_HUB_R, 2)
+        pygame.draw.circle(surface, config.COLOR_INK, (cx, cy), 2)
+
+
+# ---------------------------------------------------------------- 荡锤
+
+class Pendulum(object):
+    """吊在支架上来回摆的带刺铁球。
+
+    和刺轮互补：刺轮考"读转速"，荡锤考"读相位"——锤子走到最高点开始回摆
+    的那一瞬间是唯一的空档，站在下面等的人必须等到摆回去。
+
+    摆角用正弦而不是真实单摆方程：真实单摆在大摆幅下周期会随幅度变化，
+    玩家背下来的节奏会漂；正弦摆的周期是常数，背一次就永远对。
+    """
+
+    def __init__(self, px, py, phase=0.0):
+        self.px = float(px)
+        self.py = float(py)
+        self.phase = phase
+        self.t = 0.0
+        self.angle = 0.0
+
+    # ---- 运行期 ----
+    def reset(self):
+        self.t = 0.0
+        self.angle = config.PENDULUM_AMP * math.sin(self.phase)
+
+    def update(self, dt, player=None):
+        self.t += dt
+        self.angle = config.PENDULUM_AMP * math.sin(
+            self.t * config.PENDULUM_SPEED + self.phase)
+        return None
+
+    def bob(self):
+        arm = config.PENDULUM_ARM
+        return (self.px + math.sin(self.angle) * arm,
+                self.py + math.cos(self.angle) * arm)
+
+    def hitbox(self):
+        bx, by = self.bob()
+        r = config.PENDULUM_BOB_R
+        return pygame.Rect(int(bx - r), int(by - r), r * 2, r * 2)
+
+    def hits(self, rect):
+        bx, by = self.bob()
+        return _rect_circle(rect, bx, by, config.PENDULUM_BOB_R)
+
+    def draw(self, surface, ox, oy):
+        # 吊点：一块小铁板 + 一颗螺栓。H 格本身就在半空，所以要有个"焊在
+        # 什么上面"的交代，否则锤子像是凭空吊着的。
+        px = int(self.px) + ox
+        py = int(self.py) + oy
+        plate = pygame.Rect(px - 20, py - 9, 40, 9)
+        pygame.draw.rect(surface, (140, 134, 124), plate)
+        pygame.draw.rect(surface, config.COLOR_INK, plate, 2)
+        pygame.draw.circle(surface, config.COLOR_INK, (px, py), 3)
+
+        # 摆动轨迹：一串淡点，把"锤子会扫到哪儿"提前画出来。
+        # 玩家真正需要读的就是这个圆弧的下沿——它决定了哪一段路是禁区。
+        a0 = -config.PENDULUM_AMP
+        a1 = config.PENDULUM_AMP
+        _dashed_arc(surface, (206, 190, 184), px, py,
+                    config.PENDULUM_ARM, math.pi * 0.5 + a0,
+                    math.pi * 0.5 + a1, steps=26, dash=2)
+
+        bx, by = self.bob()
+        bx, by = int(bx) + ox, int(by) + oy
+        # 链条：一串小点，比直线更像"锁链"，也不用画绳子的抖动
+        for i in range(1, config.PENDULUM_CHAIN_DOTS):
+            k = i / float(config.PENDULUM_CHAIN_DOTS)
+            dx = px + (bx - px) * k
+            dy = py + (by - py) * k
+            pygame.draw.circle(surface, (110, 106, 100), (int(dx), int(dy)), 2)
+
+        r = config.PENDULUM_BOB_R
+        pygame.draw.circle(surface, (120, 116, 110), (bx, by), r)
+        pygame.draw.circle(surface, config.COLOR_INK, (bx, by), r, 2)
+        # 六颗尖刺
+        for i in range(6):
+            a = i * math.pi / 3.0
+            x0 = bx + math.cos(a) * r
+            y0 = by + math.sin(a) * r
+            x1 = bx + math.cos(a) * (r + 6)
+            y1 = by + math.sin(a) * (r + 6)
+            pygame.draw.line(surface, config.COLOR_INK,
+                             (int(x0), int(y0)), (int(x1), int(y1)), 2)

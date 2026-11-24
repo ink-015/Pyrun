@@ -655,6 +655,18 @@ class GameScene(Scene):
                 self.die({"^": u"踩到地刺", "v": u"撞到天花板刺",
                           "~": u"落水"}.get(ch, u"碰到危险格"))
                 return
+            # 会动的机关在静态危险格之后、敌人之前：踩到刺上同时被刀片扫到，
+            # 报"踩到地刺"更符合玩家看到的因果。
+            mech = self.world.mechanism_hit(rect)
+            if mech is not None:
+                self.die(mech)
+                return
+            # 踩怪必须判在"被怪撞到"之前：踩中的那一帧脚底一定和判定框相交，
+            # 先判死就永远踩不下去，玩家只会觉得"这怪根本踩不了"。
+            stomped = self.world.stomp(p)
+            if stomped is not None and stomped.stomp():
+                p.stomp_bounce()
+                self.toast(u"踩掉了走地怪", 1.2)
             # 敌人判定放在危险格之后：踩刺而死比"恰好和蝙蝠重叠"更该被报告，
             # 玩家也更认这个因果。
             hit = self.world.enemy_hit(rect)

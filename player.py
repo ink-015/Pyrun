@@ -84,6 +84,9 @@ class Player(object):
         # 弹跳板只改 vy，不改位置；bounce_count 给自检用来验证"一次落下只弹一次"
         self.bounce_cd = 0.0
         self.bounce_count = 0
+        # 踩死走地怪的次数（M7）。和 bounce_count 分开记账：一个是踩弹簧，
+        # 一个是踩怪，混在一起会让"一次落下只弹一次"那条自检变得含糊。
+        self.stomp_count = 0
 
         # ---- 道具：滑翔伞（M5）----
         # has_glider 是"这一关拿没拿到"，不是角色属性：重开本关要重新去捡，
@@ -301,6 +304,23 @@ class Player(object):
         self.jump_buffer = 0.0
         self.bounce_cd = config.BOUNCE_COOLDOWN
         self.bounce_count += 1
+        return True
+
+    def stomp_bounce(self, speed=None):
+        """踩中走地怪头顶后的反弹。
+
+        和 bounce() 的区别只有两点：初速更低（560，够跳过一格台阶，不足以
+        飞上高台），而且不占用弹跳板的冷却——刚踩完怪就落到弹跳板上时，
+        两个机制不该互相取消。
+        """
+        speed = config.STOMP_BOUNCE if speed is None else speed
+        self.vy = -abs(float(speed))
+        self.on_ground = False
+        self.jumping = False
+        self.coyote = 0.0
+        self.jump_buffer = 0.0
+        self.gliding = False
+        self.stomp_count += 1
         return True
 
     def stands_on(self, rect, tol=2.0):
@@ -612,6 +632,7 @@ class Player(object):
             "dash  %s  cd %.2f  n=%d"
             % ("ON" if self.dashing else "  ", self.dash_cd, self.dash_count),
             "bounce %d  cd %.2f" % (self.bounce_count, self.bounce_cd),
+            "stomp  %d" % self.stomp_count,
             "glide %s  %s  %d 帧"
             % ("ON " if self.gliding else "off",
                "有伞" if self.has_glider else "无伞", self.glide_frames),

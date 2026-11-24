@@ -39,6 +39,9 @@ TILE_NPC = "N"
 TILE_BAT = "B"
 TILE_UFO = "U"
 TILE_ROCK = "R"
+TILE_WALKER = "Z"
+TILE_ROTOR = "X"
+TILE_HAMMER = "H"
 
 LEGEND = {
     ".": u"空气",
@@ -61,6 +64,9 @@ LEGEND = {
     "M": u"水平移动平台",
     "m": u"垂直移动平台",
     "R": u"落石点",
+    "Z": u"走地怪（可踩）",
+    "X": u"旋转刺轮",
+    "H": u"荡锤",
     "?": u"伪装砖",
     "W": u"墙刺机关",
     "K": u"钥匙",
@@ -126,6 +132,9 @@ class _Parsed(object):
         self.bats = []            # [(col, row)]  M6 蝙蝠（连续段稍后合并）
         self.ufos = []            # [(col, row)]
         self.rock_spawns = []     # [(col, row)]  天花板裂缝
+        self.walkers = []         # [(col, row)]  M7 走地怪（连续段稍后合并）
+        self.rotors = []          # [(col, row)]  M7 旋转刺轮（轴心）
+        self.hammers = []         # [(col, row)]  M7 荡锤（吊点所在格）
         self.platforms = []       # [(col, row, ch)]  同字符连续段稍后合并
         self.others = []          # [(col, row, ch)]  已识别但暂未实现
         # M6 文本：按文件出现顺序排队，与地图里 S / N 的出现顺序一一配对
@@ -240,6 +249,12 @@ def _parse(path):
                 out.ufos.append((col, row))
             elif ch == TILE_ROCK:
                 out.rock_spawns.append((col, row))
+            elif ch == TILE_WALKER:
+                out.walkers.append((col, row))
+            elif ch == TILE_ROTOR:
+                out.rotors.append((col, row))
+            elif ch == TILE_HAMMER:
+                out.hammers.append((col, row))
             elif ch in ("M", "m"):
                 out.platforms.append((col, row, ch))
             elif ch in HAZARD_CHARS:
@@ -443,6 +458,43 @@ def _bat_runs(cells):
                 tail = min(b, a + step - 1)
                 out.append((a * tile + tile // 2, tail * tile + tile // 2,
                             row * tile + tile // 2))
+                a = tail + 1
+    return out
+
+
+# ---------------------------------------------------------------- 走地怪巡逻段
+
+def _walker_runs(cells):
+    """把同一行里连续的 'Z' 合成一条巡逻线，返回 [(左px, 右px, 行号)]。
+
+    和蝙蝠同一个思路，但范围取**格子边界**而不是中心：走地怪的宽度是
+    36px，按中心算会让它在两端的半个身位悬空，看起来像踩在空气上。
+    超长段直接截断成几段（和蝙蝠一样），不让一张画错的图把整关堵死。
+    """
+    by_row = {}
+    for col, row in cells:
+        by_row.setdefault(row, []).append(col)
+
+    tile = config.TILE
+    out = []
+    for row in sorted(by_row):
+        cols = sorted(by_row[row])
+        start = prev = cols[0]
+        runs = []
+        for c in cols[1:]:
+            if c == prev + 1:
+                prev = c
+                continue
+            runs.append((start, prev))
+            start = prev = c
+        runs.append((start, prev))
+        for a, b in runs:
+            step = config.WALKER_RUN_MAX
+            while a <= b:
+                tail = min(b, a + step - 1)
+                out.append((a * tile + config.WALKER_BODY_W // 2,
+                            (tail + 1) * tile - config.WALKER_BODY_W // 2,
+                            row))
                 a = tail + 1
     return out
 
@@ -697,8 +749,29 @@ class World(object):
                 enemy.RockSpawner(c * tile + tile // 2, r * tile,
                                   ground, (0.35 + 0.27 * i) % 1.0))
         self.rock_spawners.sort(key=lambda s: s.cx)
+        # M7：走地怪。落地点取"脚下第一块实心"，找不到就退回本格底边——
+        # 悬空的走地怪看着像bug，但仍然让它站在某个高度上，不要掉进虚空里。
+        self.walkers = []
+        for i, (left, right, row) in enumerate(_walker_runs(parsed.walkers)):
+            mid = (left + right) * 0.5
+            ground = self.ground_y_below(mid, (row + 1) * tile)
+            if ground is None:
+                ground = (row + 1) * tile
+            self.walkers.append(
+                enemy.Walker(left, right, ground, phase=(0.37 * i) % 1.0))
+        # M7：旋转刺轮与荡锤。相位按列号错开，免得一排机关同步得像节拍器。
+        self.rotors = [enemy.Rotor(c * tile + tile // 2, r * tile + tile // 2,
+                                   phase=((c * 0.53 + r * 0.29) % 2.0))
+                       for c, r in parsed.rotors]
+        # 荡锤的吊点取 H 格的**顶边**：地图里 H 必须写在横梁正下方，
+        # 吊点贴着梁底，锤子看起来才是吊在梁上的。
+        self.hammers = [enemy.Pendulum(c * tile + tile // 2, r * tile,
+                                       phase=((c * 0.41) % 2.0))
+                        for c, r in parsed.hammers]
         # 更新顺序：会发石头的（UFO/裂缝）在前，之后统一推进已有的石头
-        self.enemies = list(self.ufos) + list(self.rock_spawners) + list(self.bats)
+        self.enemies = (list(self.ufos) + list(self.rock_spawners)
+                        + list(self.bats) + list(self.walkers)
+                        + list(self.rotors) + list(self.hammers))
         self.rocks = []            # 场上的落石，碎完自动回收
         self.rock_count = 0        # 累计投下多少块，调试与自检用
         self._prompt_font = None   # 惰性取字体，避免每帧查缓存表
@@ -918,17 +991,58 @@ class World(object):
     def enemy_hit(self, rect):
         """玩家判定盒是否撞上敌人，返回死亡原因或 None。
 
-        只查蝙蝠和正在下落的石头。UFO 与天花板裂缝本身不带判定：
+        只查蝙蝠、走地怪和正在下落的石头。UFO 与天花板裂缝本身不带判定：
         "头顶有个碰不得的东西"在跑酷里是纯噪音。
         """
         for b in self.bats:
             box = b.hitbox()
             if box is not None and rect.colliderect(box):
                 return u"被蝙蝠撞到"
+        for w in self.walkers:
+            box = w.hitbox()
+            if box is not None and rect.colliderect(box):
+                return u"被走地怪撞到"
         for r in self.rocks:
             box = r.hitbox()
             if box is not None and rect.colliderect(box):
                 return u"被落石砸中"
+        return None
+
+    def stomp(self, player):
+        """判断这一帧是不是踩中了走地怪的头顶。
+
+        三个条件缺一不可：
+          - 正在下落（vy > 0）：站着碰到怪物的头顶不该是"踩死"而是"撞上"；
+          - 玩家判定盒与怪物相交；
+          - 脚底落在怪物判定框的上 70%（STOMP_TOP_RATIO）以内。
+        最后一条是关键。只判相交的话，从侧面擦上去也会被算成踩踏，
+        表现为"人贴着怪死了一半又被弹起来"，比直接死更让人困惑。
+        """
+        if player.vy <= 0.0:
+            return None
+        for w in self.walkers:
+            zone = w.stomp_zone()
+            if zone is None:
+                continue
+            if player.rect.colliderect(w.hitbox()) \
+                    and player.rect.bottom <= zone.bottom:
+                return w
+        return None
+
+    # ---- 机关（M7）----
+    def mechanism_hit(self, rect):
+        """旋转刺轮 / 荡锤的判定。返回死亡原因或 None。
+
+        它们和"危险格"分开：危险格是静态的、烘焙在地形上的，这两个会动，
+        而且判定是"沿臂采样"和"圆心距离"，不是矩形相交。
+        合并到 hazard_at 里会让那张表看不出哪些格是常驻危险。
+        """
+        for r in self.rotors:
+            if r.hits(rect):
+                return u"被旋转刀片绞到"
+        for h in self.hammers:
+            if h.hits(rect):
+                return u"被荡锤砸中"
         return None
 
     def _spawn_rock(self, req):
@@ -1102,6 +1216,12 @@ class World(object):
             u.draw(surface, ox, oy)
         for s in self.rock_spawners:
             s.draw(surface, ox, oy)
+        for r in self.rotors:
+            r.draw(surface, ox, oy)
+        for h in self.hammers:
+            h.draw(surface, ox, oy)
+        for w in self.walkers:
+            w.draw(surface, ox, oy)
         for r in self.rocks:
             r.draw(surface, ox, oy)
 
@@ -1388,6 +1508,12 @@ class World(object):
             extra.append(u"UFO %d" % len(self.ufos))
         if self.rock_spawners:
             extra.append(u"落石点 %d" % len(self.rock_spawners))
+        if self.walkers:
+            extra.append(u"走地怪 %d" % len(self.walkers))
+        if self.rotors:
+            extra.append(u"旋转刺轮 %d" % len(self.rotors))
+        if self.hammers:
+            extra.append(u"荡锤 %d" % len(self.hammers))
         if self.signs:
             extra.append(u"告示牌 %d" % len(self.signs))
         if self.npcs:

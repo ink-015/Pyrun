@@ -8,6 +8,7 @@ M2 物理部分是纯逻辑，只操作 Player + Rect，不读键盘、不画图
 每条断言都对应 README §19 的某一项验收，不许靠手感。
 """
 
+import math
 import os
 import tempfile
 
@@ -1712,6 +1713,346 @@ def test_m6_playable(app):
            % (frames, frames * DT, w.taken_coins, w.total_coins, scene.deaths))
 
 
+# ---------------------------------------------------------------- M7 新机关
+
+L5 = os.path.join(config.LEVEL_DIR, "l5.txt")
+
+
+def test_walker():
+    _section(u"M7 走地怪")
+
+    w = enemy.Walker(100.0, 200.0, 300.0)
+    lo, hi = 1e9, -1e9
+    for _ in range(400):
+        w.update(DT)
+        lo = min(lo, w.cx)
+        hi = max(hi, w.cx)
+    _check(u"走地怪不走出巡逻区", lo >= 100.0 - 0.01 and hi <= 200.0 + 0.01,
+           u"x ∈ [%.1f, %.1f]" % (lo, hi))
+    _check(u"走地怪真的在走（两端都到过）", hi > 195.0 and lo < 105.0,
+           u"最近 %.1f / %.1f" % (lo, hi))
+
+    box = w.hitbox()
+    _check(u"走地怪判定框贴地且比身体窄",
+           box.width < config.WALKER_BODY_W and box.bottom >= 300 - 4,
+           u"box=%s，身体宽 %d" % (box, config.WALKER_BODY_W))
+    zone = w.stomp_zone()
+    _check(u"可踩区域在判定框上 70%",
+           zone.height == int(box.height * config.STOMP_TOP_RATIO)
+           and zone.top == box.top,
+           u"zone=%s box=%s" % (zone, box))
+
+    # 踩一次：立刻失去判定（同一帧不能再被判成碰撞），0.5 秒后彻底消失
+    _check(u"第一次踩中有效", w.stomp() is True)
+    _check(u"被踩后不再有致死判定", w.hitbox() is None and not w.alive,
+           u"state=%s" % w.state)
+    _check(u"同一只踩不了第二次", w.stomp() is False)
+    frames = 0
+    while w.state != "gone" and frames < 200:
+        w.update(DT)
+        frames += 1
+    _check(u"闪烁 %.1fs 后消失" % config.WALKER_DIE_TIME,
+           abs(frames * DT - config.WALKER_DIE_TIME) < 0.05,
+           u"实测 %.2fs" % (frames * DT))
+
+    w.reset()
+    _check(u"重开后复活", w.alive and w.hitbox() is not None, w.state)
+
+
+def test_rotor():
+    _section(u"M7 旋转刺轮")
+
+    r = enemy.Rotor(1000.0, 600.0, phase=0.0)
+    arms = r.arms()
+    _check(u"四臂等分", len(arms) == config.ROTOR_ARMS
+           and abs(arms[1][0] - arms[0][0] - math.pi / 2) < 1e-6,
+           u"%d 条臂" % len(arms))
+    _check(u"臂长恒定",
+           all(abs(math.hypot(x - r.cx, y - r.cy) - config.ROTOR_ARM_LEN) < 0.01
+               for _, x, y in arms),
+           u"臂长 %.0f" % config.ROTOR_ARM_LEN)
+
+    # 远处的玩家永远安全
+    far = pygame.Rect(2000, 600, 26, 70)
+    hit_far = 0
+    for _ in range(240):
+        r.update(DT)
+        if r.hits(far):
+            hit_far += 1
+    _check(u"离得远不会被扫到", hit_far == 0, u"%d 帧" % hit_far)
+
+    # 轴心正下方：既不能是必死（玩家没活路），也不能完全无害（等于装饰）
+    under = pygame.Rect(int(r.cx) - 13, 634, 26, 70)
+    r.reset()
+    hit = 0
+    N = 900
+    for _ in range(N):
+        r.update(DT)
+        if r.hits(under):
+            hit += 1
+    ratio = hit / float(N)
+    _check(u"轴心下方是危险的但留得出窗口", 0.15 < ratio < 0.85,
+           u"命中 %.0f%%（安全窗口 %.2fs）"
+           % (ratio * 100, (1.0 - ratio) * 2 * math.pi / config.ROTOR_SPEED))
+
+    # 判定必须"跟着角度走"，不能是一个固定的外接框
+    r.angle = 0.0
+    side = pygame.Rect(int(r.cx) - 13, 634, 26, 70)
+    _check(u"臂正对下方时命中", r.hits(side))
+    r.angle = math.pi / 4
+    _check(u"臂转到对角线时让开", not r.hits(side))
+
+
+def test_pendulum():
+    _section(u"M7 荡锤")
+
+    h = enemy.Pendulum(1000.0, 400.0, phase=0.0)
+    worst = 0.0
+    for _ in range(600):
+        h.update(DT)
+        bx, by = h.bob()
+        d = math.hypot(bx - h.px, by - h.py)
+        worst = max(worst, abs(d - config.PENDULUM_ARM))
+    _check(u"锤心始终在摆长上（不做假动画）", worst < 0.01,
+           u"最大偏差 %.4fpx" % worst)
+
+    bobs = []
+    h.reset()
+    for _ in range(400):
+        h.update(DT)
+        bobs.append(h.bob())
+    _check(u"摆动到两侧（不是原地晃）",
+           max(b[0] for b in bobs) - min(b[0] for b in bobs) > 100,
+           u"水平行程 %.0fpx" % (max(b[0] for b in bobs) - min(b[0] for b in bobs)))
+    _check(u"最高点高于最低点（真的在摆而不是平移）",
+           max(b[1] for b in bobs) - min(b[1] for b in bobs) > 40,
+           u"竖直行程 %.0fpx" % (max(b[1] for b in bobs) - min(b[1] for b in bobs)))
+
+    # 站在锤心最低点正下方：会被扫到；但一定存在"摆到外侧"的安全时刻
+    low = 400.0 + config.PENDULUM_ARM
+    under = pygame.Rect(1000 - 13, int(low) - 35, 26, 70)
+    h.reset()
+    hit = 0
+    for _ in range(600):
+        h.update(DT)
+        if h.hits(under):
+            hit += 1
+    _check(u"锤摆过正下方时会命中", hit > 0, u"%d 帧" % hit)
+    _check(u"但不是必死（有安全相位）", hit < 600, u"命中 %d/600" % hit)
+
+
+def test_m7_parse():
+    _section(u"M7 关卡解析：新机关与空中道具")
+    try:
+        w = world.World.load(L5)
+    except world.LevelError as exc:
+        _check(u"l5 可加载", False, exc.describe())
+        return None
+
+    _check(u"l5 尺寸 66x14", (w.width_tiles, w.height_tiles) == (66, 14),
+           u"%d x %d" % (w.width_tiles, w.height_tiles))
+    _check(u"2 只走地怪", len(w.walkers) == 2, u"%d 只" % len(w.walkers))
+    _check(u"1 个刺轮", len(w.rotors) == 1, u"%d 个" % len(w.rotors))
+    _check(u"1 个荡锤", len(w.hammers) == 1, u"%d 个" % len(w.hammers))
+    _check(u"1 把伞", len(w.gliders) == 1, u"%d 把" % len(w.gliders))
+
+    # 走地怪必须站在地上
+    for wk in w.walkers:
+        _check(u"走地怪脚下是实心",
+               w.is_solid_px(wk.cx, wk.ground_y + 4),
+               u"x=%.0f ground=%.0f" % (wk.cx, wk.ground_y))
+
+    # 吊点上方必须是横梁，否则锤子像凭空吊着
+    for h in w.hammers:
+        _check(u"荡锤吊在横梁下", w.is_solid_px(h.px, h.py - 6),
+               u"吊点 (%.0f, %.0f)" % (h.px, h.py))
+
+    # 半空中的伞：悬在水面上方，底边明显高于岸面——"站着够不到，得跳出去"
+    it = w.gliders[0]
+    col = it["col"]
+    ledge = None
+    for dc in (-1, 1):
+        g = w.ground_y_below((col + dc) * config.TILE + config.TILE // 2,
+                             it["rect"].bottom + 4)
+        if g is not None:
+            ledge = g if ledge is None else min(ledge, g)
+    _check(u"伞悬在岸面上方 1~2 格",
+           ledge is not None and 0 < ledge - it["rect"].bottom <= 2 * config.TILE,
+           u"伞底边 %d，岸面 %s" % (it["rect"].bottom, ledge))
+    _check(u"伞脚下一格是水（没地方站）",
+           w.cell_at_px(it["rect"].centerx,
+                        it["rect"].bottom + config.TILE) == "~",
+           w.cell_at_px(it["rect"].centerx,
+                        it["rect"].bottom + config.TILE))
+    # 站在岸边（最后一格）够不到：判定区在水的正上方，只靠走是拿不到的
+    stand = pygame.Rect(col * config.TILE - player.Player.WIDTH,
+                        (ledge or 0) - player.Player.HEIGHT,
+                        player.Player.WIDTH, player.Player.HEIGHT)
+    _check(u"站在岸边够不到（必须跳出去）", not stand.colliderect(it["rect"]),
+           u"站立 %s / 判定 %s" % (stand, it["rect"]))
+    return w
+
+
+def test_m7_scene(app):
+    _section(u"M7 踩怪 / 机关致死 / 重开复位")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L5)
+    w = scene.world
+    if w is None:
+        _check(u"l5 可加载", False, scene.load_error)
+        return
+    W = player.Player.WIDTH
+    H = player.Player.HEIGHT
+
+    # ---- 从上方落到走地怪头上：踩死 + 反弹 ----
+    wk = w.walkers[0]
+    scene.player.teleport(wk.cx - W * 0.5, wk.ground_y - H - 60)
+    scene.invuln = 0.0
+    scene.override_axis = 0.0
+    frames = 0
+    while not scene.player.stomp_count and frames < 60:
+        scene.update(DT)
+        frames += 1
+    _check(u"落到头顶能踩死", scene.player.stomp_count == 1,
+           u"%d 帧后踩中 %d 次（state=%s）"
+           % (frames, scene.player.stomp_count, wk.state))
+    _check(u"踩死时玩家还在（不是同归于尽）", scene.deaths == 0,
+           u"死亡 %d 次：%s" % (scene.deaths, scene.last_death_cause))
+    _check(u"踩完被弹起来", scene.player.vy < 0,
+           u"vy=%.0f" % scene.player.vy)
+    _check(u"被踩的怪进入闪烁", wk.state == "dying", wk.state)
+    # 闪烁期没有判定：接着跑几帧，人还在空中/刚落地，都不该再死一次
+    for _ in range(8):
+        scene.update(DT)
+    _check(u"踩死之后不会再被判死", scene.deaths == 0,
+           u"死亡 %d 次：%s" % (scene.deaths, scene.last_death_cause))
+
+    # ---- 侧面撞上去会死 ----
+    scene.restart()
+    wk = w.walkers[0]
+    scene.player.teleport(wk.cx - W * 0.5, wk.ground_y - H)
+    scene.invuln = 0.0
+    scene.update(DT)
+    _check(u"侧面撞到走地怪会死",
+           scene.deaths == 1 and u"走地怪" in scene.last_death_cause,
+           u"死亡 %d 次，原因「%s」" % (scene.deaths, scene.last_death_cause))
+
+    # ---- 刺轮扫死 ----
+    scene.restart()
+    rot = w.rotors[0]
+    scene.player.teleport(rot.cx - W * 0.5, 11 * config.TILE - H)
+    scene.invuln = 0.0
+    frames = 0
+    while not scene.deaths and frames < 400:
+        scene.update(DT)
+        frames += 1
+    _check(u"站在刺轮下面会被扫死",
+           scene.deaths == 1 and u"刀片" in scene.last_death_cause,
+           u"%d 帧（%.1fs）后死亡：「%s」"
+           % (frames, frames * DT, scene.last_death_cause))
+
+    # ---- 荡锤砸死 ----
+    scene.restart()
+    ham = w.hammers[0]
+    scene.player.teleport(ham.px - W * 0.5, 11 * config.TILE - H)
+    scene.invuln = 0.0
+    frames = 0
+    while not scene.deaths and frames < 400:
+        scene.update(DT)
+        frames += 1
+    _check(u"站在锤子下面会被砸死",
+           scene.deaths == 1 and u"荡锤" in scene.last_death_cause,
+           u"%d 帧（%.1fs）后死亡：「%s」"
+           % (frames, frames * DT, scene.last_death_cause))
+
+    # ---- 重开：怪复活、机关回相位 ----
+    scene.restart()
+    _check(u"重开后走地怪全部复活",
+           all(wk.alive for wk in w.walkers),
+           u"%s" % [wk.state for wk in w.walkers])
+    _check(u"重开后玩家重建，整关统计归零", scene.player.stomp_count == 0,
+           u"%d" % scene.player.stomp_count)
+    _check(u"重开后刺轮回到初始相位",
+           abs(w.rotors[0].angle - w.rotors[0].phase) < 1e-6,
+           u"angle=%.3f phase=%.3f" % (w.rotors[0].angle, w.rotors[0].phase))
+
+
+def test_m7_air_glider(app):
+    _section(u"M7 半空中的滑翔伞")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L5)
+    w = scene.world
+    if w is None:
+        _check(u"l5 可加载", False, scene.load_error)
+        return
+
+    # 从岸上跳出去：伞在水面上方，必须靠跳（而不是走过去）拿
+    scene.player.teleport(56 * config.TILE - player.Player.WIDTH,
+                          9 * config.TILE - player.Player.HEIGHT)
+    scene.override_axis = 1.0
+    scene.input.jump_held = True
+    scene.input.jump_pressed = True
+    got_air = False
+    for _ in range(70):
+        scene.update(DT)
+        if scene.player.has_glider:
+            got_air = not scene.player.on_ground
+            break
+    _check(u"跳出去能拿到半空中的伞",
+           scene.player.has_glider, u"has_glider=%s" % scene.player.has_glider)
+    _check(u"拿到时人在空中（不是站着捡的）", got_air,
+           u"on_ground=%s y=%.0f" % (scene.player.on_ground, scene.player.y))
+
+    frames = 0
+    while not scene.goal_reached and frames < 600:
+        scene.input.jump_held = True
+        scene.update(DT)
+        frames += 1
+    _check(u"滑翔过水坑到达对岸", scene.goal_reached and scene.deaths == 0,
+           u"%d 帧（%.1fs）通关，死亡 %d 次"
+           % (frames, frames * DT, scene.deaths))
+
+
+def test_m7_playable(app):
+    _section(u"M7 第 5 关地形可通关")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(L5)
+    w = scene.world
+    if w is None:
+        _check(u"l5 可加载", False, scene.load_error)
+        return
+
+    # 只测地形与滑翔：机关全关（它们测的是反应，不是地形）
+    w.bats = []
+    w.ufos = []
+    w.rock_spawners = []
+    w.walkers = []
+    w.rotors = []
+    w.hammers = []
+    w.enemies = []
+    w.rocks = []
+
+    scene.override_axis = 1.0
+    frames = 0
+    for f in range(3600):
+        _auto_step(scene)
+        scene.update(DT)
+        frames = f
+        if scene.goal_reached:
+            break
+    scene.override_axis = None
+    scene.input.jump_held = False
+    _check(u"l5 从出生点跑到终点", scene.goal_reached,
+           u"%d 帧（%.1f 秒），金币 %d/%d，死亡 %d"
+           % (frames, frames * DT, w.taken_coins, w.total_coins, scene.deaths))
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -1739,6 +2080,13 @@ def run(app):
     test_m6_errors()
     test_m6_scene(app)
     test_m6_playable(app)
+    test_walker()
+    test_rotor()
+    test_pendulum()
+    test_m7_parse()
+    test_m7_scene(app)
+    test_m7_air_glider(app)
+    test_m7_playable(app)
     test_level_parse()
     test_level_errors()
     test_camera()
