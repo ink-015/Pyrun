@@ -26,10 +26,6 @@ import world
 DT = config.FIXED_DT
 RESULTS = []
 
-# 自检故意让角色死几百次。事件日志是给试玩看的，这里关掉，
-# 否则几百行"死亡 N：…"会把真正的断言结果冲到看不见。
-config.LOG_EVENTS = False
-
 
 def _check(name, cond, detail=""):
     RESULTS.append((bool(cond), name, detail))
@@ -2669,6 +2665,21 @@ def run(app):
     print(u" 火柴人跑酷 · 分阶段自检")
     print("=" * 60)
 
+    # 自检故意让角色死几百次。事件日志是给试玩看的，这里关掉，否则
+    # 几百行"死亡 N：…"会把真正的断言结果冲到看不见。
+    #
+    # **必须放在函数里，不能写在模块顶层**：main.py 在顶部就 import 了
+    # selftest（为了 --selftest），模块级的副作用会连正常游戏一起关掉——
+    # 试玩时一行死因都没打出来，查了半天才发现是这里。
+    saved_log = config.LOG_EVENTS
+    config.LOG_EVENTS = False
+    try:
+        return _run_all(app)
+    finally:
+        config.LOG_EVENTS = saved_log
+
+
+def _run_all(app):
     test_scenes(app)
     test_sprites()
     test_anim_state()
