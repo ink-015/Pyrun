@@ -42,6 +42,10 @@ TILE_ROCK = "R"
 TILE_WALKER = "Z"
 TILE_ROTOR = "X"
 TILE_HAMMER = "H"
+TILE_BRICK = "?"          # M8 伪装砖
+TILE_WALLSPIKE = "W"      # M8 天花板落刺
+TILE_RISER = "!"          # M8 突墙
+TILE_TWIN = "T"           # M8 二连落石
 
 LEGEND = {
     ".": u"空气",
@@ -68,7 +72,9 @@ LEGEND = {
     "X": u"旋转刺轮",
     "H": u"荡锤",
     "?": u"伪装砖",
-    "W": u"墙刺机关",
+    "W": u"天花板落刺",
+    "!": u"突墙",
+    "T": u"二连落石",
     "K": u"钥匙",
     "E": u"门",
 }
@@ -135,6 +141,10 @@ class _Parsed(object):
         self.walkers = []         # [(col, row)]  M7 走地怪（连续段稍后合并）
         self.rotors = []          # [(col, row)]  M7 旋转刺轮（轴心）
         self.hammers = []         # [(col, row)]  M7 荡锤（吊点所在格）
+        self.bricks = []          # [(col, row)]  M8 伪装砖（就是地面那一格）
+        self.wall_spikes = []     # [(col, row)]  M8 天花板落刺（空中那格）
+        self.risers = []          # [(col, row)]  M8 突墙（地面正上方那格）
+        self.twins = []           # [(col, row)]  M8 二连落石（第一块的位置）
         self.platforms = []       # [(col, row, ch)]  同字符连续段稍后合并
         self.others = []          # [(col, row, ch)]  已识别但暂未实现
         # M6 文本：按文件出现顺序排队，与地图里 S / N 的出现顺序一一配对
@@ -255,6 +265,14 @@ def _parse(path):
                 out.rotors.append((col, row))
             elif ch == TILE_HAMMER:
                 out.hammers.append((col, row))
+            elif ch == TILE_BRICK:
+                out.bricks.append((col, row))
+            elif ch == TILE_WALLSPIKE:
+                out.wall_spikes.append((col, row))
+            elif ch == TILE_RISER:
+                out.risers.append((col, row))
+            elif ch == TILE_TWIN:
+                out.twins.append((col, row))
             elif ch in ("M", "m"):
                 out.platforms.append((col, row, ch))
             elif ch in HAZARD_CHARS:
@@ -776,10 +794,35 @@ class World(object):
         self.hammers = [enemy.Pendulum(c * tile + tile // 2, r * tile,
                                        phase=((c * 0.41) % 2.0))
                         for c, r in parsed.hammers]
-        # 更新顺序：会发石头的（UFO/裂缝）在前，之后统一推进已有的石头
+        # ---- 隐形机关（M8）----
+        # 伪装砖：写在**地面那一格**（`?` 本身就当地板用），所以它的矩形
+        # 顶边就是行走面，不需要再对齐到"脚下第一块实心"。
+        self.bricks = [enemy.CrumbleBrick(c, r) for c, r in parsed.bricks]
+        # 天花板落刺：`W` 写在空中那格，它头顶那格必须是实心——刺是从天花板
+        # 里扎下来的，没有天花板就没有安装点（生成器会先报这个错）。
+        self.drop_spikes = []
+        for c, r in parsed.wall_spikes:
+            ground = self.ground_y_below(c * tile + tile // 2, (r + 1) * tile)
+            if ground is None:
+                # 底下是坑或水：刺照样掉到底图底部，玩家本来也会死在那里
+                ground = self.bounds.bottom
+            self.drop_spikes.append(
+                enemy.DropSpike(c * tile + tile // 2, r * tile, ground))
+        # 突墙：`!` 写在地面**正上方那一格**（不能写进地面，否则地上就破了个
+        # 洞），墙从这格的底边往上长，也就是从地板面往上长。
+        self.risers = [enemy.RisingWall(c * tile + tile // 2, (r + 1) * tile)
+                       for c, r in parsed.risers]
+        # 二连落石：`T` 是**近的那一块**，远的那块固定往右偏 TWIN_GAP。
+        self.twins = [enemy.TwinRock(c * tile + tile // 2, r * tile,
+                                     config.TWIN_GAP)
+                      for c, r in parsed.twins]
+        # 更新顺序：会发石头的（UFO/裂缝/二连石）在前，之后统一推进已有的石头
         self.enemies = (list(self.ufos) + list(self.rock_spawners)
-                        + list(self.bats) + list(self.walkers)
-                        + list(self.rotors) + list(self.hammers))
+                        + list(self.twins) + list(self.bats)
+                        + list(self.walkers)
+                        + list(self.rotors) + list(self.hammers)
+                        + list(self.bricks) + list(self.drop_spikes)
+                        + list(self.risers))
         self.rocks = []            # 场上的落石，碎完自动回收
         self.rock_count = 0        # 累计投下多少块，调试与自检用
         self._prompt_font = None   # 惰性取字体，避免每帧查缓存表
@@ -876,17 +919,30 @@ class World(object):
         self._update_focus(player)
 
     def collision_solids(self):
-        """本帧玩家要撞的实心矩形：地形 + 移动平台。
+        """本帧玩家要撞的实心矩形：地形 + 移动平台 + 还没塌的伪装砖 + 升起的突墙。
+
+        伪装砖和突墙必须进这张表：它们**就是地面和墙本身**，只是会变。
+        把"会消失的地板"做成危险格是另一种做法，但那意味着玩家站在上面
+        的那 0.3 秒里仍在"踩空判定"里——看起来站着，其实已经死了。
 
         返回的是内部复用的同一个 list，调用方不要保存或修改它。
-        没有平台时直接返回地形表，连拼一遍都省了。
+        没有动态物件时直接返回地形表，连拼一遍都省了。
         """
-        if not self.platforms:
+        if not (self.platforms or self.bricks or self.risers):
             return self.solids
-        self._dynamic_solids[:] = self.solids
+        lst = self._dynamic_solids
+        lst[:] = self.solids
         for p in self.platforms:
-            self._dynamic_solids.append(p.rect)
-        return self._dynamic_solids
+            lst.append(p.rect)
+        for b in self.bricks:
+            r = b.solid()
+            if r is not None:
+                lst.append(r)
+        for w in self.risers:
+            r = w.solid()
+            if r is not None:
+                lst.append(r)
+        return lst
 
     def carrying_platform(self, player):
         """玩家正站在哪块移动平台上，没有则 None。"""
@@ -1037,13 +1093,16 @@ class World(object):
                 return w
         return None
 
-    # ---- 机关（M7）----
+    # ---- 机关（M7 / M8）----
     def mechanism_hit(self, rect):
-        """旋转刺轮 / 荡锤的判定。返回死亡原因或 None。
+        """会动的致死机关：旋转刺轮 / 荡锤 / 天花板落刺。返回死亡原因或 None。
 
-        它们和"危险格"分开：危险格是静态的、烘焙在地形上的，这两个会动，
-        而且判定是"沿臂采样"和"圆心距离"，不是矩形相交。
+        它们和"危险格"分开：危险格是静态的、烘焙在地形上的，这些会动，
+        而且判定是"沿臂采样"、"圆心距离"、"只判刺头"，不是矩形相交。
         合并到 hazard_at 里会让那张表看不出哪些格是常驻危险。
+
+        伪装砖和突墙**不在这里**：它们不杀人，只改地形（前者变没，后者变多），
+        所以走的是碰撞表那条路，见 collision_solids()。
         """
         for r in self.rotors:
             if r.hits(rect):
@@ -1051,9 +1110,24 @@ class World(object):
         for h in self.hammers:
             if h.hits(rect):
                 return u"被荡锤砸中"
+        for s in self.drop_spikes:
+            if s.hits(rect):
+                return u"被天花板落刺扎到"
         return None
 
     def _spawn_rock(self, req):
+        if req[0] == "twin":
+            # 二连石：两块同一帧"预订"，但预警长短不同。远的那块影子收得
+            # 更快，于是玩家会先看见它要落——这正是这一招的提示。
+            _, (xa, ya), (xb, yb) = req
+            for x, y, warn in ((xa, ya, config.TWIN_WARN_A),
+                               (xb, yb, config.TWIN_WARN_B)):
+                ground = self.ground_y_below(x, y)
+                if ground is None:
+                    ground = self.bounds.bottom
+                self.rocks.append(enemy.FallingRock(x, y, ground, warn))
+                self.rock_count += 1
+            return
         _, x, y = req
         ground = self.ground_y_below(x, y)
         if ground is None:
@@ -1061,6 +1135,23 @@ class World(object):
             ground = self.bounds.bottom
         self.rocks.append(enemy.FallingRock(x, y, ground))
         self.rock_count += 1
+
+    def reset_traps(self):
+        """把机关复位。**每次重生/回检查点都要调**。
+
+        伪装砖和突墙是会"留在场上"的机关：砖踩塌之后如果不复位，玩家在
+        篝火重生、跑回坑边时会发现桥已经没了——那不是难，是卡死。
+        落石也一并清掉：重生那一刻头顶还挂着半块石头，最没道理。
+        """
+        for b in self.bricks:
+            b.reset()
+        for s in self.drop_spikes:
+            s.reset()
+        for w in self.risers:
+            w.reset()
+        for t in self.twins:
+            t.reset()
+        self.rocks = []
 
     def collect(self, player_rect):
         """拾取与玩家碰撞盒相交的金币，返回本次吃到的个数。"""
@@ -1213,6 +1304,10 @@ class World(object):
                 self._draw_glider_item(surface, it, ox, oy)
         for p in self.platforms:
             self._draw_platform(surface, p, ox, oy)
+        # 伪装砖就是地板，紧跟平台之后画；塌掉的位置画虚线，让"会再长回来"
+        # 这件事在画面上说清楚
+        for b in self.bricks:
+            b.draw(surface, ox, oy)
 
         for s in self.signs:
             self._draw_sign(surface, s, ox, oy)
@@ -1224,10 +1319,18 @@ class World(object):
             u.draw(surface, ox, oy)
         for s in self.rock_spawners:
             s.draw(surface, ox, oy)
+        for t in self.twins:
+            t.draw(surface, ox, oy)
         for r in self.rotors:
             r.draw(surface, ox, oy)
         for h in self.hammers:
             h.draw(surface, ox, oy)
+        for s in self.drop_spikes:
+            s.draw(surface, ox, oy)
+        # 突墙画在角色之前（world 整体先于玩家绘制）：墙"从地里长出来"时
+        # 应该是把角色挡住，而不是糊在角色脸上。
+        for w in self.risers:
+            w.draw(surface, ox, oy)
         for w in self.walkers:
             w.draw(surface, ox, oy)
         for r in self.rocks:
@@ -1522,6 +1625,14 @@ class World(object):
             extra.append(u"旋转刺轮 %d" % len(self.rotors))
         if self.hammers:
             extra.append(u"荡锤 %d" % len(self.hammers))
+        if self.bricks:
+            extra.append(u"伪装砖 %d" % len(self.bricks))
+        if self.drop_spikes:
+            extra.append(u"天花板落刺 %d" % len(self.drop_spikes))
+        if self.risers:
+            extra.append(u"突墙 %d" % len(self.risers))
+        if self.twins:
+            extra.append(u"二连落石 %d" % len(self.twins))
         if self.signs:
             extra.append(u"告示牌 %d" % len(self.signs))
         if self.npcs:

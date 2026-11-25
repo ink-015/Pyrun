@@ -2247,6 +2247,329 @@ def test_m7_checkpoint(app):
            u"x=%.0f，篝火 x=%d" % (scene.player.x, cp2["spawn"][0]))
 
 
+# ---------------------------------------------------------------- M8 隐形机关
+
+L6 = os.path.join(config.LEVEL_DIR, "l6.txt")
+M8_FLOOR = 11 * config.TILE          # l6 的地面高度（脚底 y）
+
+
+def _m8_scene(app, path=None):
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(path or L6)
+    return scene
+
+
+def _m8_place(scene, x, feet=None):
+    feet = M8_FLOOR if feet is None else feet
+    scene.player.teleport(x, feet - player.Player.HEIGHT)
+    scene.camera.snap_to(scene.player.rect)
+    scene.invuln = 0.0
+    scene.death_timer = 0.0
+    scene.world.reset_traps()
+
+
+def _m8_drive(scene, frames, axis=1.0):
+    scene.override_axis = axis
+    for _ in range(frames):
+        scene.update(DT)
+
+
+def _m8_wait_death(scene, frames):
+    """跑到死为止，返回用了几帧（没死返回 frames）。"""
+    n = scene.deaths
+    i = 0
+    while i < frames and scene.deaths == n:
+        scene.update(DT)
+        i += 1
+    return i
+
+
+def test_m8_parse():
+    _section(u"M8 第 6 关：四种隐形机关")
+    try:
+        w = world.World.load(L6)
+    except world.LevelError as exc:
+        _check(u"l6 可加载", False, exc.describe())
+        return None
+
+    _check(u"l6 尺寸 72x14", (w.width_tiles, w.height_tiles) == (72, 14),
+           u"%d x %d" % (w.width_tiles, w.height_tiles))
+    _check(u"11 格伪装砖", len(w.bricks) == 11, u"%d 格" % len(w.bricks))
+    _check(u"3 根天花板落刺", len(w.drop_spikes) == 3,
+           u"%d 根" % len(w.drop_spikes))
+    _check(u"1 堵突墙", len(w.risers) == 1, u"%d 堵" % len(w.risers))
+    _check(u"1 处二连落石", len(w.twins) == 1, u"%d 处" % len(w.twins))
+    cols = [c["col"] for c in w.checkpoints]
+    _check(u"3 个篝火且按列升序", cols == sorted(cols) and len(cols) == 3,
+           u"%s" % cols)
+
+    # 伪装砖必须真的在"地面"那一层：顶边就是行走面，踩上去才成立
+    _check(u"伪装砖顶边与地面齐平",
+           all(b.rect.top == M8_FLOOR for b in w.bricks),
+           u"%s" % sorted(set(b.rect.top for b in w.bricks)))
+    # 砖下面必须是空的，否则塌了也看不出，机关等于没放
+    _check(u"伪装砖下面是空的（能看见坑）",
+           all(not w.is_solid_px(b.rect.centerx, b.rect.bottom + 6)
+               for b in w.bricks),
+           u"%s" % [(b.col, w.is_solid_px(b.rect.centerx, b.rect.bottom + 6))
+                    for b in w.bricks])
+
+    # 落刺必须挂在天花板上
+    for s in w.drop_spikes:
+        _check(u"落刺 %.0f 挂在天花板下" % s.cx,
+               w.is_solid_px(s.cx, s.top_y - 6),
+               u"top=%.0f" % s.top_y)
+
+    # 突墙：地面上的槽、比跳高还高
+    for r in w.risers:
+        _check(u"突墙站在地面上", w.is_solid_px(r.cx, r.floor_y + 4),
+               u"floor=%.0f" % r.floor_y)
+        _check(u"突墙比跳高更高（跳不过去）",
+               config.WALL_H > 127 + 12,
+               u"墙 %d / 跳高 127" % config.WALL_H)
+    return w
+
+
+def test_m8_brick(app):
+    _section(u"M8 伪装砖：跑得过去，停不下来")
+
+    scene = _m8_scene(app)
+    w = scene.world
+    _m8_place(scene, 4 * config.TILE)
+    _m8_drive(scene, 6)
+    _m8_drive(scene, 96)
+    _check(u"一路跑过 4 格砖不掉下去", scene.deaths == 0,
+           u"死亡 %d「%s」x=%.0f" % (scene.deaths, scene.last_death_cause,
+                                    scene.player.x))
+    _check(u"跑过之后砖确实塌了",
+           any(b.state == "gone" for b in w.bricks),
+           u"%s" % [b.state for b in w.bricks[:4]])
+
+    # 站在砖上不动 → 塌 → 掉进刺里
+    scene = _m8_scene(app)
+    _m8_place(scene, 8 * config.TILE)
+    _m8_drive(scene, 1, axis=0.0)
+    used = _m8_wait_death(scene, 90)
+    _check(u"站在砖上不动会塌下去摔死", scene.deaths == 1,
+           u"%d 帧，原因「%s」" % (used, scene.last_death_cause))
+
+    # 塌掉之后会自己长回来（走回头路不能卡死）
+    scene = _m8_scene(app)
+    w = scene.world
+    _m8_place(scene, 4 * config.TILE)
+    for b in w.bricks:
+        b.state = "gone"
+        b.timer = 0.05
+    _m8_drive(scene, int(config.BRICK_RESTORE / DT) + 6, axis=0.0)
+    _check(u"塌掉 3 秒后砖自己长回来",
+           all(b.state == "idle" for b in w.bricks),
+           u"%s" % sorted(set(b.state for b in w.bricks)))
+
+
+def test_m8_spike(app):
+    _section(u"M8 天花板落刺：跑过去，别停下")
+
+    scene = _m8_scene(app)
+    w = scene.world
+    s0 = w.drop_spikes[0]
+    _check(u"平时不判死（收在天花板里）", s0.hitbox() is None,
+           u"state=%s" % s0.state)
+
+    # 全速穿过三根刺
+    _m8_place(scene, 16 * config.TILE)
+    _m8_drive(scene, 4)
+    _m8_drive(scene, 150)
+    _check(u"全速跑过三根刺不会死", scene.deaths == 0,
+           u"死亡 %d「%s」x=%.0f" % (scene.deaths, scene.last_death_cause,
+                                    scene.player.x))
+    _check(u"跑过的时候刺确实扎下来了",
+           any(s.state != "idle" for s in w.drop_spikes),
+           u"%s" % [s.state for s in w.drop_spikes])
+
+    # 停在刺底下 → 挨扎
+    scene = _m8_scene(app)
+    _m8_place(scene, 18 * config.TILE + 20)
+    _m8_drive(scene, 1, axis=0.0)
+    used = _m8_wait_death(scene, 90)
+    _check(u"停在刺底下会被扎到", scene.deaths == 1,
+           u"%d 帧，原因「%s」" % (used, scene.last_death_cause))
+
+    # 走远之后才重新上膛：否则站在刺旁边会被反复砸
+    scene = _m8_scene(app)
+    w = scene.world
+    s0 = w.drop_spikes[0]
+    _m8_place(scene, 18 * config.TILE + 20)
+    scene.invuln = 99.0        # 只测上膛逻辑，先别让它把人扎死
+    _m8_drive(scene, 100, axis=0.0)
+    _check(u"扎过一次之后不再上膛", s0.armed is False,
+           u"state=%s armed=%s" % (s0.state, s0.armed))
+    scene.player.teleport(s0.cx + config.SPIKE_TRIGGER + config.TILE + 40,
+                          M8_FLOOR - player.Player.HEIGHT)
+    _m8_drive(scene, 3, axis=0.0)
+    _check(u"走远之后重新上膛", s0.armed is True, u"armed=%s" % s0.armed)
+
+
+def test_m8_wall(app):
+    _section(u"M8 突墙：跳不过去，只能等")
+
+    scene = _m8_scene(app)
+    w = scene.world
+    wl = w.risers[0]
+    _m8_place(scene, 30 * config.TILE)
+    _m8_drive(scene, 4)
+
+    blocked_x = None
+    rose = False
+    for i in range(70):
+        scene.update(DT)
+        if wl.state in ("rise", "hold"):
+            rose = True
+        if wl.h >= config.WALL_H:
+            blocked_x = scene.player.rect.right
+            break
+    _check(u"走近之后墙会顶起来", rose and wl.h >= config.WALL_H,
+           u"h=%.0f state=%s" % (wl.h, wl.state))
+    _check(u"墙是实心的（进碰撞表）", wl.solid() is not None,
+           u"solid=%s" % (wl.solid(),))
+
+    # 撞上去：人被挡在墙左边，而不是穿过去
+    _m8_drive(scene, 40)
+    _check(u"人停在墙前面（没有穿墙）",
+           scene.player.rect.right <= wl.cx - config.WALL_THICK // 2 + 1,
+           u"人右沿 %d / 墙左沿 %d"
+           % (scene.player.rect.right, wl.cx - config.WALL_THICK // 2))
+
+    # 等它缩回去，然后能过去
+    for _ in range(120):
+        scene.update(DT)
+        if wl.state == "idle":
+            break
+    _check(u"墙会自己缩回去", wl.h <= 0.5, u"h=%.0f" % wl.h)
+    _m8_drive(scene, 60)
+    _check(u"缩回去之后人过得去", scene.player.rect.left > wl.cx,
+           u"x=%.0f / 墙 %.0f" % (scene.player.x, wl.cx))
+    _check(u"过突墙不会死", scene.deaths == 0,
+           u"死亡 %d「%s」" % (scene.deaths, scene.last_death_cause))
+
+    # 站在槽上不会被顶起来（唯一的"会卡死"的错误）
+    scene = _m8_scene(app)
+    wl = scene.world.risers[0]
+    _m8_place(scene, wl.cx - player.Player.WIDTH // 2)
+    before = scene.player.rect.copy()
+    _m8_drive(scene, 60, axis=0.0)
+    _check(u"站在槽上墙不会升（不夹人）",
+           wl.h <= 0.5 and scene.deaths == 0,
+           u"h=%.0f 死亡 %d" % (wl.h, scene.deaths))
+    _check(u"站在槽上人也没被挤走",
+           abs(scene.player.rect.x - before.x) <= 2,
+           u"%d → %d" % (before.x, scene.player.rect.x))
+
+
+def test_m8_twin(app):
+    _section(u"M8 二连落石：远的那块影子先收")
+
+    scene = _m8_scene(app)
+    w = scene.world
+    tw = w.twins[0]
+    _m8_place(scene, 39 * config.TILE)
+    _m8_drive(scene, 4)
+    _m8_drive(scene, 40)
+    _check(u"走近就掉两块石头", len(w.rocks) == 2, u"%d 块" % len(w.rocks))
+    if len(w.rocks) == 2:
+        wa = w.rocks[0].warn_total
+        wb = w.rocks[1].warn_total
+        _check(u"远的那块预警更长（影子先出现）", wb > wa,
+               u"近 %.2fs / 远 %.2fs" % (wa, wb))
+        _check(u"两块石头落点隔 2 格",
+               abs(w.rocks[1].x - w.rocks[0].x) == config.TWIN_GAP,
+               u"%.0f px" % abs(w.rocks[1].x - w.rocks[0].x))
+
+    # 站中间那一格是安全的
+    scene = _m8_scene(app)
+    _m8_place(scene, 43 * config.TILE + 19)
+    _m8_drive(scene, 1, axis=0.0)
+    _m8_drive(scene, 120, axis=0.0)
+    _check(u"站在两块影子中间不会死", scene.deaths == 0,
+           u"死亡 %d「%s」" % (scene.deaths, scene.last_death_cause))
+
+    # 站在近那块底下会死
+    scene = _m8_scene(app)
+    _m8_place(scene, 42 * config.TILE + 19)
+    _m8_drive(scene, 1, axis=0.0)
+    used = _m8_wait_death(scene, 90)
+    _check(u"站在近那块底下会被砸到", scene.deaths == 1,
+           u"%d 帧，原因「%s」" % (used, scene.last_death_cause))
+
+
+def test_m8_respawn(app):
+    _section(u"M8 重生时机关必须复位")
+
+    scene = _m8_scene(app)
+    w = scene.world
+    _m8_place(scene, 8 * config.TILE)
+    _m8_drive(scene, 1, axis=0.0)
+    used = _m8_wait_death(scene, 90)
+    _check(u"踩塌伪装砖掉下去会死", scene.deaths == 1,
+           u"%d 帧「%s」" % (used, scene.last_death_cause))
+    _check(u"死的时候砖确实是塌的",
+           any(b.state == "gone" for b in w.bricks),
+           u"%s" % [b.state for b in w.bricks[:4]])
+
+    _run(scene, int(config.DEATH_FREEZE / DT) + 4)
+    _check(u"重生了", scene.respawn_count == 1, u"%d 次" % scene.respawn_count)
+    _check(u"重生后伪装砖全部复位（不会卡死在坑边）",
+           all(b.state == "idle" for b in w.bricks),
+           u"%s" % [b.state for b in w.bricks[:4]])
+    _check(u"重生后场上没有残留的落石", not w.rocks, u"%d 块" % len(w.rocks))
+
+    # 重生点本身不能在机关的触发圈里
+    for cp in w.checkpoints:
+        cx = cp["spawn"][0] + player.Player.WIDTH // 2
+        for s in w.drop_spikes:
+            _check(u"篝火 %d 列重生点不在落刺的触发圈里" % cp["col"],
+                   abs(cx - s.cx) > config.SPIKE_TRIGGER,
+                   u"距离 %.0fpx" % abs(cx - s.cx))
+
+
+def test_m8_playable(app):
+    _section(u"M8 第 6 关整关跑通")
+
+    scene = _m8_scene(app)
+    w = scene.world
+
+    # 一个只会两件事的自动驾驶：一直往右；前面有升起的墙就停。
+    # 它证明的是"这关的机关有解"，而不是"操作好"——落刺、伪装砖、
+    # 二连石都靠"别停"过，突墙靠"等它落下"过，一个跳都不用按。
+    reached = False
+    frames = 0
+    waits = 0
+    while frames < 2000:
+        blocked = False
+        for wl in w.risers:
+            r = wl.solid()
+            if r is not None and 0 < r.left - scene.player.rect.right < 96:
+                blocked = True
+        if blocked:
+            waits += 1
+        scene.override_axis = 0.0 if blocked else 1.0
+        scene.update(DT)
+        frames += 1
+        if scene.goal_reached:
+            reached = True
+            break
+
+    _check(u"自动驾驶跑完全关", reached,
+           u"%d 帧（%.1f 秒），x=%.0f" % (frames, frames * DT, scene.player.x))
+    _check(u"全程 0 死亡", scene.deaths == 0,
+           u"死亡 %d「%s」" % (scene.deaths, scene.last_death_cause))
+    _check(u"路上确实等过突墙", waits > 0, u"等了 %d 帧" % waits)
+    _check(u"金币至少拿到一半", w.taken_coins * 2 >= w.total_coins,
+           u"%d / %d" % (w.taken_coins, w.total_coins))
+    print(u"    通关：%.1f 秒，金币 %d/%d，死亡 %d"
+          % (frames * DT, w.taken_coins, w.total_coins, scene.deaths))
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -2282,6 +2605,13 @@ def run(app):
     test_m7_checkpoint(app)
     test_m7_air_glider(app)
     test_m7_playable(app)
+    test_m8_parse()
+    test_m8_brick(app)
+    test_m8_spike(app)
+    test_m8_wall(app)
+    test_m8_twin(app)
+    test_m8_respawn(app)
+    test_m8_playable(app)
     test_level_parse()
     test_level_errors()
     test_camera()

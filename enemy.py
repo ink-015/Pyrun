@@ -201,12 +201,17 @@ class FallingRock(object):
     可以看、可以记的东西。
     """
 
-    def __init__(self, x, y, ground_y):
+    def __init__(self, x, y, ground_y, warn=None):
         self.x = float(x)
         self.y = float(y)
         self.ground_y = float(ground_y)
         self.state = "warn"
-        self.warn = config.ROCK_WARN_TIME
+        # 每块石头自己记总时长：M8 的二连石要让"远的那块影子先收拢"，
+        # 两块石头的预警长度不一样。绘制阴影时用各自的总时长算比例，
+        # 才不会出现"远的那块影子一下子缩没了"。
+        self.warn_total = (config.ROCK_WARN_TIME if warn is None
+                           else float(warn))
+        self.warn = self.warn_total
         self.vy = 0.0
         self.shard = 0.0
         self.dead = False
@@ -249,7 +254,7 @@ class FallingRock(object):
         if self.state == "warn":
             # 阴影随倒计时收拢：收拢到最小的一瞬间石头落下。
             # "看着它缩到你脚下"比任何数字倒计时都直观。
-            ratio = max(0.0, self.warn / max(1e-6, config.ROCK_WARN_TIME))
+            ratio = max(0.0, self.warn / max(1e-6, self.warn_total))
             half = 14 + 26 * ratio
             _shadow(surface, cx, gy, half, (60, 56, 52), alpha=70,
                     outline=config.COLOR_MUTED)
@@ -760,3 +765,472 @@ class Pendulum(object):
             y1 = by + math.sin(a) * (r + 6)
             pygame.draw.line(surface, config.COLOR_INK,
                              (int(x0), int(y0)), (int(x1), int(y1)), 2)
+
+
+# ---------------------------------------------------------------- M8 隐形机关
+#
+# 这一组和前面所有敌人的区别是：**它们不追你，只在原地等你犯错**。
+# 共同点因此不是"移动方式"，而是"线索"——每种机关都有一样东西，
+# 在触发之前就已经摆在画面上（薄板、黑线、地槽、两道影子）。
+# 没有线索的陷阱在跑酷里等于随机死亡，玩家学不到任何东西。
+
+
+def _hash01(a, b):
+    """确定性伪随机（0..1）。手绘抖动必须每帧一样，否则画面会沸腾。
+
+    目前只在伪装砖的板面纹理上用得上（每一格纹理略有不同，才不像
+    流水线产品）；塌陷时的抖动是**时间**函数，不能用这个。
+    """
+    h = (a * 73856093) ^ (b * 19349663)
+    return (h & 0xFFFF) / 65535.0
+
+
+class CrumbleBrick(object):
+    """伪装砖：看着像地板，其实只有薄薄一层壳，踩上 0.3 秒就塌。
+
+    它考的不是反应速度，而是**别在这条路上停**：跑速 300px/s 时 0.3 秒
+    能走 1.4 格，塌陷永远追不上人；一旦停下看风景，脚下就没了。
+
+    公平性靠"它和真地面长得不一样"：
+      - 真地面是整块土，只有顶线，砖缝里还有竖纹；
+      - 伪装砖是一块四面描边的薄板，下面能直接看到坑（画面里是纸底）。
+    所以不需要背板——第一次见到也能看出"这块板是浮着的"。
+
+    塌掉 3 秒后自己长回来。没有这条，玩家掉进坑里重生后可能面对一条
+    已经塌空的桥，那就成了"死一次就再也过不去"。
+    """
+
+    def __init__(self, col, row):
+        self.col = col
+        self.row = row
+        tile = config.TILE
+        self.rect = pygame.Rect(col * tile, row * tile,
+                                tile, config.BRICK_THICK)
+        self.state = "idle"      # idle → crack → gone → idle
+        self.timer = 0.0
+        self.t = 0.0
+
+    # ---- 运行期 ----
+    def reset(self):
+        self.state = "idle"
+        self.timer = 0.0
+        self.t = 0.0
+
+    def solid(self):
+        """给碰撞用的矩形；塌掉之后返回 None。"""
+        if self.state == "gone":
+            return None
+        return self.rect
+
+    def update(self, dt, player=None):
+        self.t += dt
+        if self.state == "gone":
+            self.timer -= dt
+            if self.timer <= 0.0:
+                self.state = "idle"
+                self.timer = 0.0
+            return None
+        if self.state == "crack":
+            self.timer -= dt
+            if self.timer <= 0.0:
+                self.state = "gone"
+                self.timer = config.BRICK_RESTORE
+            return None
+        # idle：踩上就开始裂。容差 3px：落地那一帧脚底可能还差一两像素。
+        if player is not None and player.stands_on(self.rect, 3.0):
+            self.state = "crack"
+            self.timer = config.BRICK_CRACK_TIME
+        return None
+
+    # ---- 绘制 ----
+    def draw(self, surface, ox, oy):
+        rect = self.rect
+        x = rect.x + ox
+        y = rect.y + oy
+        w, h = rect.w, rect.h
+
+        if self.state == "gone":
+            # 只留一圈虚线：告诉玩家"这里本来是块砖，会再长回来"，
+            # 而不是一个看不出所以然的大洞。
+            for i in range(0, w, 12):
+                pygame.draw.line(surface, (208, 202, 190),
+                                 (x + i, y + h), (x + min(i + 6, w), y + h), 1)
+            return
+
+        if self.state == "crack":
+            # 抖：抖动幅度随剩余时间变大，快塌的时候最明显
+            k = 1.0 - max(0.0, self.timer) / max(1e-6, config.BRICK_CRACK_TIME)
+            dx = int(round(math.sin(self.t * 46.0) * config.BRICK_SHAKE * k))
+        else:
+            dx = 0
+        surf_x = x + dx
+
+        pygame.draw.rect(surface, config.COLOR_GROUND, (surf_x, y, w, h))
+        # 四面描边：这是它和真地面唯一的区别。真地面只在临空侧画线。
+        pygame.draw.line(surface, config.COLOR_INK, (surf_x, y + 1),
+                         (surf_x + w, y + 1), 3)
+        pygame.draw.line(surface, config.COLOR_INK, (surf_x, y + h - 1),
+                         (surf_x + w, y + h - 1), 3)
+        pygame.draw.line(surface, config.COLOR_INK, (surf_x + 1, y + 1),
+                         (surf_x + 1, y + h - 1), 2)
+        pygame.draw.line(surface, config.COLOR_INK, (surf_x + w - 2, y + 1),
+                         (surf_x + w - 2, y + h - 1), 2)
+
+        # 板面上的两道浅纹：不管塌没塌，都在暗示"这是拼上去的"。
+        # 位置按格子做一点确定性偏移，免得一整排砖看起来像盖章盖出来的。
+        k = _hash01(self.col, self.row)
+        for base in (0.26, 0.58):
+            cx = surf_x + int(w * (base + 0.14 * k))
+            pygame.draw.line(surface, (214, 209, 198),
+                             (cx, y + 4), (cx + 5, y + h - 4), 1)
+        if self.state == "crack":
+            # 裂纹：从左上往右下劈开，比颤抖更直接
+            cx = surf_x + w // 2
+            pygame.draw.line(surface, config.COLOR_INK, (cx - 7, y + 2),
+                             (cx + 2, y + h - 3), 2)
+            pygame.draw.line(surface, config.COLOR_INK, (cx + 2, y + h - 3),
+                             (cx + 9, y - 1), 2)
+
+
+class DropSpike(object):
+    """天花板落刺：收在顶上，人一走近就扎下来。
+
+    规则一句话：**别停在这根刺下面**。
+    从触发到扎到地上约 0.55 秒，而全速跑过去只需要 0.52 秒——刚好擦着
+    它的边过去。停下、慢走、回头，都会挨这一下。
+
+    线索三层，一层比一层明显：平时只有顶上一道 1px 黑线；进入触发距离
+    开始抖并掉灰；落下时带一道竖直的拖影。
+    """
+
+    def __init__(self, cx, top_y, ground_y):
+        self.cx = float(cx)
+        self.top_y = float(top_y)
+        self.ground_y = float(ground_y)
+        self.state = "idle"      # idle → warn → fall → hold → retract
+        self.timer = 0.0
+        self.tip = self.top_y
+        self.armed = True
+        self.t = 0.0
+
+    # ---- 运行期 ----
+    def reset(self):
+        self.state = "idle"
+        self.timer = 0.0
+        self.tip = self.top_y
+        self.armed = True
+        self.t = 0.0
+
+    def update(self, dt, player=None):
+        self.t += dt
+        if self.state == "idle":
+            if player is None:
+                return None
+            d = abs(player.rect.centerx - self.cx)
+            if not self.armed:
+                # 走远了才重新上膛：否则站在刺旁边会被反复砸，像卡住了
+                if d > config.SPIKE_TRIGGER + config.TILE:
+                    self.armed = True
+                return None
+            if d <= config.SPIKE_TRIGGER:
+                self.state = "warn"
+                self.timer = config.SPIKE_WARN
+                self.armed = False
+            return None
+
+        self.timer -= dt
+        if self.state == "warn":
+            if self.timer <= 0.0:
+                self.state = "fall"
+        elif self.state == "fall":
+            self.tip += config.SPIKE_FALL_SPEED * dt
+            if self.tip >= self.ground_y:
+                self.tip = self.ground_y
+                self.state = "hold"
+                self.timer = config.SPIKE_HOLD
+        elif self.state == "hold":
+            if self.timer <= 0.0:
+                self.state = "retract"
+        elif self.state == "retract":
+            self.tip -= (self.ground_y - self.top_y) / config.SPIKE_RETRACT * dt
+            if self.tip <= self.top_y:
+                self.tip = self.top_y
+                self.state = "idle"
+                self.timer = config.SPIKE_COOLDOWN
+        return None
+
+    def hitbox(self):
+        # 只有"扎下来"和"钉在地上"这两段有判定。收回去的过程不判，
+        # 免得玩家明明在往上跑却被一把正在收起的刺判死。
+        if self.state not in ("fall", "hold"):
+            return None
+        h = config.SPIKE_HEAD_H
+        return pygame.Rect(int(self.cx - config.SPIKE_HALF_W),
+                           int(self.tip - h),
+                           config.SPIKE_HALF_W * 2, h)
+
+    def hits(self, rect):
+        box = self.hitbox()
+        return box is not None and rect.colliderect(box)
+
+    # ---- 绘制 ----
+    def draw(self, surface, ox, oy):
+        cx = int(self.cx) + ox
+        top = int(self.top_y) + oy
+        tip = int(self.tip) + oy
+
+        if self.state == "idle":
+            # 收在天花板里：一道黑线 + 三颗小齿。看得见，但不碍眼。
+            pygame.draw.line(surface, config.COLOR_INK, (cx - 15, top + 1),
+                             (cx + 15, top + 1), 2)
+            for dx in (-11, 0, 11):
+                pygame.draw.line(surface, config.COLOR_INK,
+                                 (cx + dx, top + 1), (cx + dx, top + 5), 2)
+            return
+
+        if self.state == "warn":
+            # 抖 + 掉灰：抖是"要来了"，掉灰是"它已经在动了"
+            shake = int(round(math.sin(self.t * 62.0) * 2.0))
+            sx = cx + shake
+            pygame.draw.line(surface, config.COLOR_INK, (sx - 15, top + 1),
+                             (sx + 15, top + 1), 2)
+            for dx in (-11, 0, 11):
+                pygame.draw.line(surface, config.COLOR_INK,
+                                 (sx + dx, top + 1), (sx + dx, top + 5), 2)
+            for i in range(3):
+                k = ((self.t * 60.0 + i * 9.0) % 26.0)
+                pygame.draw.circle(surface, (198, 190, 178),
+                                   (cx + (i - 1) * 7, top + 6 + int(k)), 1)
+            return
+
+        head_h = config.SPIKE_HEAD_H
+        # 杆：两根细线夹一条浅色，比一根粗线更像"铁杆"
+        if tip - head_h > top:
+            pygame.draw.line(surface, (150, 144, 134), (cx - 3, top),
+                             (cx - 3, tip - head_h + 4), 2)
+            pygame.draw.line(surface, (150, 144, 134), (cx + 3, top),
+                             (cx + 3, tip - head_h + 4), 2)
+        if self.state == "fall":
+            for k in range(3):
+                y0 = tip - head_h - 6 - k * 9
+                pygame.draw.line(surface, (206, 198, 186),
+                                 (cx, y0), (cx, y0 - 6), 2)
+        # 刺头：倒三角，尖端朝下
+        pts = [(cx - config.SPIKE_HALF_W, tip - head_h),
+               (cx + config.SPIKE_HALF_W, tip - head_h),
+               (cx, tip)]
+        pygame.draw.polygon(surface, (150, 144, 134), pts)
+        pygame.draw.polygon(surface, config.COLOR_INK, pts, 2)
+
+
+class RisingWall(object):
+    """突墙：地上一道槽，人走近就"长"出一堵墙，挡住去路。
+
+    140px 高，比跳高（127px）高一截，**跳不过去**——这是它存在的理由。
+    能跳过去的话它只是个"多按一下跳"的台阶。
+
+    它不杀人，只拦路：升起 0.12 秒、停 0.75 秒、缩回 0.22 秒。
+    所以它考的是"别抢"：看见地上那道槽就知道该收脚，等一下它自己就下去了。
+    和落刺（不许停）刚好相反——两种规则交替出现，玩家才需要读路。
+
+    防夹人：升起过程中一旦发现玩家在墙的位置，立刻转成缩回。
+    宁可让它"没能升起来"，也不能把人卡进墙里——那是唯一会让人卡死的错。
+    """
+
+    def __init__(self, cx, floor_y):
+        self.cx = float(cx)
+        self.floor_y = float(floor_y)
+        self.h = 0.0
+        self.state = "idle"      # idle → rise → hold → retract → wait
+        self.timer = 0.0
+        self.armed = True
+        self.t = 0.0
+
+    # ---- 运行期 ----
+    def reset(self):
+        self.h = 0.0
+        self.state = "idle"
+        self.timer = 0.0
+        self.armed = True
+        self.t = 0.0
+
+    def rect(self):
+        h = int(max(0.0, self.h))
+        return pygame.Rect(int(self.cx - config.WALL_THICK * 0.5),
+                           int(self.floor_y - h),
+                           config.WALL_THICK, h)
+
+    def column(self):
+        """墙**完全升起时**占的那一块。用来判断"人是不是正站在槽上"。
+
+        不能拿 rect() 判断：还没升起来时它高度是 0，`rect.h <= 0` 一律不算
+        重叠，于是人会站在槽上被墙顶起来。这里直接按满高算。
+        """
+        return pygame.Rect(int(self.cx - config.WALL_THICK * 0.5),
+                           int(self.floor_y - config.WALL_H),
+                           config.WALL_THICK, config.WALL_H)
+
+    def solid(self):
+        if self.state == "rise":
+            # 刚冒头的那几帧不挡人：26px 都不到，挡了也只是把人绊一下，
+            # 反而容易出现"人被卡在刚长出来的墙里"。真夹住时下面还有一道
+            # abort 兜底。
+            return self.rect() if self.h >= config.WALL_READY_H else None
+        if self.state in ("hold", "retract"):
+            # 缩回去的过程中一直是实心的，直到真的没了为止。
+            # 半截墙还能穿过去的话，画面上会像"人从石头里走过去"。
+            return self.rect() if self.h >= 4 else None
+        return None
+
+    def update(self, dt, player=None):
+        self.t += dt
+        if self.state == "idle":
+            if player is None:
+                return None
+            d = abs(player.rect.centerx - self.cx)
+            if not self.armed:
+                if d > config.WALL_TRIGGER + config.TILE:
+                    self.armed = True
+                return None
+            if d > config.WALL_TRIGGER:
+                return None
+            if self.column().colliderect(player.rect):
+                # 人就站在槽上：先不打搅，等他走开。用"满高"的柱子判断，
+                # 这样一开始就不会升，而不是升到一半再缩回去（那会抽搐）。
+                return None
+            self.state = "rise"
+            self.armed = False
+            return None
+
+        if self.state == "rise":
+            self.h += config.WALL_H / config.WALL_RISE * dt
+            if self.h >= config.WALL_H:
+                self.h = config.WALL_H
+                self.state = "hold"
+                self.timer = config.WALL_HOLD
+            elif self._overlaps_player(player, 2.0):
+                # 夹人预警：立刻放弃
+                self.state = "retract"
+            return None
+
+        if self.state == "hold":
+            self.timer -= dt
+            if self.timer <= 0.0:
+                self.state = "retract"
+            return None
+
+        if self.state == "retract":
+            self.h -= config.WALL_H / config.WALL_RETRACT * dt
+            if self.h <= 0.0:
+                self.h = 0.0
+                self.state = "wait"
+                self.timer = config.WALL_COOLDOWN
+            return None
+
+        # wait：缩回去之后歇一下，避免"刚落下又升起"的抽搐
+        self.timer -= dt
+        if self.timer <= 0.0:
+            self.state = "idle"
+        return None
+
+    def _overlaps_player(self, player, slack):
+        if player is None:
+            return False
+        r = self.rect()
+        if r.h <= 0:
+            return False
+        if slack:
+            r = r.inflate(int(slack * 2), int(slack * 2))
+        return r.colliderect(player.rect)
+
+    # ---- 绘制 ----
+    def draw(self, surface, ox, oy):
+        cx = int(self.cx) + ox
+        fy = int(self.floor_y) + oy
+        half = config.WALL_THICK // 2
+
+        # 槽：地板上挖出来的一道缺口（用纸色盖掉地面线再勾边）。
+        # 这是"这里有机关"唯一的预告，必须一眼能找到——画成一条压在墨线上的
+        # 深色条会糊成"地面线加粗了"，那等于没有线索。
+        slot = pygame.Rect(cx - half, fy - 6, half * 2, 7)
+        pygame.draw.rect(surface, config.COLOR_PAPER, slot)
+        pygame.draw.rect(surface, (156, 149, 138), slot, 1)
+        for dx in (-half + 4, half - 4):
+            pygame.draw.line(surface, (156, 149, 138),
+                             (slot.x + dx, slot.y + 1),
+                             (slot.x + dx, slot.bottom - 1), 1)
+
+        if self.h <= 0.5:
+            return
+        r = self.rect()
+        x, y = r.x + ox, r.y + oy
+        # 墙面比地面白一点点（线索），边线是实墨
+        pygame.draw.rect(surface, (255, 254, 250), (x, y, r.w, r.h))
+        pygame.draw.rect(surface, config.COLOR_INK, (x, y, r.w, r.h), 2)
+        # 横纹：石砌墙的感觉，也让"它在动"更容易看出来
+        step = 18
+        yy = y + step
+        while yy < y + r.h - 4:
+            pygame.draw.line(surface, (222, 217, 206), (x + 3, yy),
+                             (x + r.w - 4, yy), 1)
+            yy += step
+        # 顶面加一道压顶线：墙是从地里顶出来的，顶上该有个"帽"
+        pygame.draw.line(surface, config.COLOR_INK, (x, y + 3),
+                         (x + r.w, y + 3), 2)
+
+
+class TwinRock(object):
+    """二连落石：一近一远，远的那块影子**先**收拢。
+
+    这是四种机关里唯一"不靠手速、靠观察"的那一个：两道影子同时出现，
+    近的那道慢、远的那道快，于是唯一安全的位置是两块之间那一格。
+    玩家要么读出来站进去，要么一口气冲过去（0.9 秒内穿过 2 格）。
+
+    影子先出现这件事本身是设计的一部分，README §6.3 里写了
+    "第二块的影子先出现"——它把"这是连招"这件事提前告诉你。
+    """
+
+    def __init__(self, cx, top_y, gap):
+        self.cx = float(cx)
+        self.top_y = float(top_y)
+        self.gap = float(gap)
+        self.armed = True
+        self.timer = 0.0
+        self.t = 0.0
+
+    # ---- 运行期 ----
+    def reset(self):
+        self.armed = True
+        self.timer = 0.0
+        self.t = 0.0
+
+    def update(self, dt, player=None):
+        self.t += dt
+        if self.timer > 0.0:
+            self.timer -= dt
+            return None
+        if player is None:
+            return None
+        d = abs(player.rect.centerx - self.cx)
+        if not self.armed:
+            if d > config.TWIN_TRIGGER + config.TILE:
+                self.armed = True
+            return None
+        if d > config.TWIN_TRIGGER:
+            return None
+        self.armed = False
+        self.timer = config.TWIN_COOLDOWN
+        y = self.top_y + config.ROCK_SIZE * 0.5
+        return ("twin", (self.cx, y), (self.cx + self.gap, y))
+
+    # ---- 绘制 ----
+    def draw(self, surface, ox, oy):
+        # 两道裂缝。就算石头的影子还没出现，玩家也能先看见"这条路上
+        # 有两个裂缝"——这是它比单块落石更值得读的地方。
+        for i, dx in enumerate((0.0, self.gap)):
+            cx = int(self.cx + dx) + ox
+            y = int(self.top_y) + oy
+            for k, ox2 in enumerate((-6, 0, 7)):
+                pygame.draw.line(surface, (150, 144, 134),
+                                 (cx + ox2, y + 1),
+                                 (cx + ox2 + 2, y + 9 + k % 2 * 3), 2)

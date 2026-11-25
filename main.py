@@ -19,6 +19,7 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-glide   第 3 关：先走过去捡伞，再抓一张滑翔中的画面
     python main.py --smoke-m6      第 4 关：NPC 对话 / 蝙蝠走廊 / 落石三张图
     python main.py --smoke-m7      第 5 关：踩怪 / 刺轮 / 荡锤 / 空中伞四张图
+    python main.py --smoke-m8      第 6 关：伪装砖 / 落刺 / 突墙 / 二连石四张图
     python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -626,6 +627,112 @@ def main():
         print(u" 滑翔     : 伞=%s 滑翔中=%s x=%.0f（水坑 57~61 列）vy=%.0f"
               % (p.has_glider, p.gliding, p.x, p.vy))
         print(" 截图   :", save_screenshot(screen, "m7_glide.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-m8" in sys.argv:
+        # M8：四张图——伪装砖、落刺、突墙、二连石。
+        # 每一张都要拍到"线索"本身：薄板下面的坑、扎下来的刺、挡路的墙、
+        # 两块还没落地的影子。这四种机关的全部信息都在画面上，拍不出来
+        # 就说明设计没落实。
+        app.level_path = os.path.join(config.LEVEL_DIR, "l6.txt")
+        app.scenes.start("game")
+        scene = app.scenes.current
+        p = scene.player
+        scene.show_debug = False
+        W = player.Player.WIDTH
+        H = player.Player.HEIGHT
+        floor = 11 * config.TILE
+
+        # 1) 伪装砖：站在砖上等它裂开，画面里同时有薄板、裂缝和下面的刺。
+        #    这里必须留在砖上——跑过去的话拍到的是"平坦地面"，看不出机关。
+        w = scene.world
+        scene.override_axis = 0.0
+        p.teleport(9 * config.TILE + 18, floor - H)
+        scene.camera.snap_to(p.rect)
+        scene.invuln = 99.0
+        for _ in range(14):
+            app.scenes.update(config.FIXED_DT)
+        # 跑过整排时，四块砖的裂纹深浅是不一样的——把那个瞬间摆出来：
+        # 只让脚下一块裂的话，角色正好把裂纹挡住，图上什么都看不到。
+        for i, b in enumerate(w.bricks[:4]):
+            b.state = "crack"
+            b.timer = config.BRICK_CRACK_TIME * (0.95 - 0.22 * i)
+        scene.invuln = 0.0          # 无敌闪烁会把角色画没，截图前清掉
+        scene.world.draw(screen, scene.camera, show_prompt=False)
+        scene._draw_player(screen)
+        scene._draw_hud(screen)
+        pygame.display.flip()
+        print(u" 伪装砖   : %s（踩上 %.2f 秒后塌）"
+              % ([b.state for b in w.bricks[:4]], config.BRICK_CRACK_TIME))
+        print(" 截图   :", save_screenshot(screen, "m8_brick.png"))
+
+        # 2) 落刺：停在触发圈里不动，等它扎到一半
+        w = scene.world
+        sp = w.drop_spikes[0]
+        p.teleport(sp.cx - W * 0.5, floor - H)
+        scene.camera.snap_to(p.rect)
+        scene.invuln = 99.0
+        for _ in range(60):
+            app.scenes.update(config.FIXED_DT)
+            if sp.state == "hold" or (sp.state == "fall" and sp.tip > 660):
+                break
+        scene.invuln = 0.0
+        scene.world.draw(screen, scene.camera, show_prompt=False)
+        scene._draw_player(screen)
+        scene._draw_hud(screen)
+        pygame.display.flip()
+        print(u" 落刺     : 状态 %s，刺尖 y=%.0f（地面 %.0f）"
+              % (sp.state, sp.tip, sp.ground_y))
+        print(" 截图   :", save_screenshot(screen, "m8_spike.png"))
+
+        # 3) 突墙：让它升到顶，人正好被挡在左边
+        w = scene.world
+        wl = w.risers[0]
+        w.reset_traps()
+        p.teleport(wl.cx - 150, floor - H)
+        scene.camera.snap_to(p.rect)
+        scene.invuln = 99.0
+        scene.override_axis = 1.0
+        for _ in range(90):
+            app.scenes.update(config.FIXED_DT)
+            if wl.h >= config.WALL_H:
+                break
+        scene.invuln = 0.0
+        scene.world.draw(screen, scene.camera, show_prompt=False)
+        scene._draw_player(screen)
+        scene._draw_hud(screen)
+        pygame.display.flip()
+        print(u" 突墙     : 高 %.0f（跳高 127），玩家右沿 %.0f / 墙左沿 %.0f"
+              % (wl.h, p.rect.right, wl.cx - config.WALL_THICK * 0.5))
+        print(" 截图   :", save_screenshot(screen, "m8_wall.png"))
+
+        # 4) 二连石：两块都在预警期，地上两道影子一大一小
+        w = scene.world
+        w.reset_traps()
+        tw = w.twins[0]
+        p.teleport(tw.cx - 140, floor - H)
+        scene.camera.snap_to(p.rect)
+        scene.invuln = 99.0
+        scene.override_axis = 0.0
+        for _ in range(40):
+            app.scenes.update(config.FIXED_DT)
+            if len(w.rocks) == 2:
+                break
+        for _ in range(18):          # 再走几帧，让两块影子都收拢一点
+            app.scenes.update(config.FIXED_DT)
+        scene.invuln = 0.0
+        scene.world.draw(screen, scene.camera, show_prompt=False)
+        scene._draw_player(screen)
+        scene._draw_hud(screen)
+        pygame.display.flip()
+        print(u" 二连石   : %d 块，预警 近 %.2fs / 远 %.2fs，落点 %.0f / %.0f"
+              % (len(w.rocks),
+                 w.rocks[0].warn_total if w.rocks else 0,
+                 w.rocks[1].warn_total if len(w.rocks) > 1 else 0,
+                 tw.cx, tw.cx + tw.gap))
+        print(" 截图   :", save_screenshot(screen, "m8_twin.png"))
+
         pygame.quit()
         return 0
 

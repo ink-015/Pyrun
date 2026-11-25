@@ -735,6 +735,10 @@ class GameScene(Scene):
         self.player.teleport(x, y)
         self.invuln = config.INVULN_TIME
         self.respawn_count += 1
+        # 机关必须跟着复位：伪装砖塌了、突墙升着，玩家跑回去就卡在坑边。
+        # 这一步放在 teleport 之后、camera 之前，重生点这一帧看到的就是
+        # "干净的"机关状态。
+        self.world.reset_traps()
         self.camera.snap_to(self.player.rect)
 
     def go_to_checkpoint(self):
@@ -749,6 +753,7 @@ class GameScene(Scene):
         self.death_timer = 0.0
         self.player.teleport(x, y)
         self.invuln = config.INVULN_TIME
+        self.world.reset_traps()
         self.camera.snap_to(self.player.rect)
         return True
 
