@@ -26,6 +26,10 @@ import world
 DT = config.FIXED_DT
 RESULTS = []
 
+# 自检故意让角色死几百次。事件日志是给试玩看的，这里关掉，
+# 否则几百行"死亡 N：…"会把真正的断言结果冲到看不见。
+config.LOG_EVENTS = False
+
 
 def _check(name, cond, detail=""):
     RESULTS.append((bool(cond), name, detail))
@@ -2395,61 +2399,110 @@ def test_m8_spike(app):
     _check(u"停在刺底下会被扎到", scene.deaths == 1,
            u"%d 帧，原因「%s」" % (used, scene.last_death_cause))
 
-    # 走远之后才重新上膛：否则站在刺旁边会被反复砸
+    # 站在圈里不会被无限连砸（边沿触发）：走完一个周期就闲着
     scene = _m8_scene(app)
     w = scene.world
     s0 = w.drop_spikes[0]
     _m8_place(scene, 18 * config.TILE + 20)
-    scene.invuln = 99.0        # 只测上膛逻辑，先别让它把人扎死
-    _m8_drive(scene, 100, axis=0.0)
-    _check(u"扎过一次之后不再上膛", s0.armed is False,
-           u"state=%s armed=%s" % (s0.state, s0.armed))
-    scene.player.teleport(s0.cx + config.SPIKE_TRIGGER + config.TILE + 40,
-                          M8_FLOOR - player.Player.HEIGHT)
-    _m8_drive(scene, 3, axis=0.0)
-    _check(u"走远之后重新上膛", s0.armed is True, u"armed=%s" % s0.armed)
+    scene.invuln = 999.0       # 只测上膛逻辑，先别让它把人扎死
+    fired = False
+    for _ in range(180):
+        scene.update(DT)
+        if s0.state != "idle":
+            fired = True
+    _check(u"站在原地会被扎一次", fired and s0.state == "idle",
+           u"state=%s" % s0.state)
+    for _ in range(60):
+        scene.update(DT)
+    _check(u"站着不动就一直闲着（不会连着砸）", s0.state == "idle",
+           u"state=%s" % s0.state)
+
+    # 玩家实测的死区：走过第 1 座、进到第 2 座的圈里再回头，
+    # 第 1 座必须重新放刺。原来"走远了才上膛"用的是 1.6 格触发距离 + 1 格，
+    # 两座刺隔 3 格（192px）时人永远走不到"够远"，第 1 座就废了。
+    scene = _m8_scene(app)
+    w = scene.world
+    s0 = w.drop_spikes[0]
+    s1 = w.drop_spikes[1]
+    _m8_place(scene, 16 * config.TILE)
+    scene.invuln = 999.0
+    went = False
+    for _ in range(140):
+        scene.override_axis = 1.0
+        scene.update(DT)
+        if abs(scene.player.rect.centerx - s1.cx) <= config.SPIKE_TRIGGER:
+            went = True
+            break
+    _check(u"先往前走，进到第 2 座的触发圈里", went,
+           u"距第 2 座 %.0fpx" % abs(scene.player.rect.centerx - s1.cx))
+
+    back_fired = False
+    for _ in range(160):
+        scene.override_axis = -1.0
+        scene.update(DT)
+        if s0.state != "idle":
+            back_fired = True
+            break
+    _check(u"回头走过第 1 座，它又放刺了（没有死区）", back_fired,
+           u"x=%.0f / 第 1 座 %.0f state=%s"
+           % (scene.player.rect.centerx, s0.cx, s0.state))
 
 
 def test_m8_wall(app):
-    _section(u"M8 突墙：跳不过去，只能等")
+    _section(u"M8 突墙：撞上去就是死，只能等")
 
     scene = _m8_scene(app)
     w = scene.world
     wl = w.risers[0]
-    _m8_place(scene, 30 * config.TILE)
+    _m8_place(scene, wl.cx - 6 * config.TILE)
     _m8_drive(scene, 4)
 
-    blocked_x = None
     rose = False
-    for i in range(70):
+    for i in range(90):
         scene.update(DT)
         if wl.state in ("rise", "hold"):
             rose = True
         if wl.h >= config.WALL_H:
-            blocked_x = scene.player.rect.right
             break
     _check(u"走近之后墙会顶起来", rose and wl.h >= config.WALL_H,
            u"h=%.0f state=%s" % (wl.h, wl.state))
     _check(u"墙是实心的（进碰撞表）", wl.solid() is not None,
            u"solid=%s" % (wl.solid(),))
+    _check(u"左面有刺：判定箱比墙面更靠左",
+           wl.hitbox() is not None and wl.hitbox().left < wl.rect().left,
+           u"刺 %s / 墙 %s" % (wl.hitbox(), wl.rect()))
 
-    # 撞上去：人被挡在墙左边，而不是穿过去
-    _m8_drive(scene, 40)
-    _check(u"人停在墙前面（没有穿墙）",
-           scene.player.rect.right <= wl.cx - config.WALL_THICK // 2 + 1,
-           u"人右沿 %d / 墙左沿 %d"
-           % (scene.player.rect.right, wl.cx - config.WALL_THICK // 2))
+    # 一路顶着跑 → 撞在刺上死掉（这是玩家要求加的"撞墙的代价"）
+    used = _m8_wait_death(scene, 120)
+    _check(u"一路顶着跑会撞在刺上死", scene.deaths == 1,
+           u"%d 帧「%s」" % (used, scene.last_death_cause))
+    _check(u"死因写的是突墙", u"突墙" in scene.last_death_cause,
+           u"「%s」" % scene.last_death_cause)
 
-    # 等它缩回去，然后能过去
-    for _ in range(120):
+    # 看见墙起来就收脚：一根刺都不碰，等它落下再走
+    scene = _m8_scene(app)
+    wl = scene.world.risers[0]
+    _m8_place(scene, wl.cx - 5 * config.TILE)
+    for _ in range(150):
+        scene.override_axis = 1.0
         scene.update(DT)
-        if wl.state == "idle":
+        if wl.state != "idle":
+            break
+    _m8_drive(scene, 16, axis=0.0)      # 急停：300px/s 刹到 0 只要 16px
+    _check(u"停得住（墙起来了没撞上去）", scene.deaths == 0,
+           u"死亡 %d「%s」距墙 %.0fpx"
+           % (scene.deaths, scene.last_death_cause,
+              wl.cx - scene.player.rect.right))
+
+    for _ in range(150):
+        scene.update(DT)
+        if wl.state == "idle" and wl.h <= 0.5:
             break
     _check(u"墙会自己缩回去", wl.h <= 0.5, u"h=%.0f" % wl.h)
     _m8_drive(scene, 60)
     _check(u"缩回去之后人过得去", scene.player.rect.left > wl.cx,
            u"x=%.0f / 墙 %.0f" % (scene.player.x, wl.cx))
-    _check(u"过突墙不会死", scene.deaths == 0,
+    _check(u"停下等一次全程不死", scene.deaths == 0,
            u"死亡 %d「%s」" % (scene.deaths, scene.last_death_cause))
 
     # 站在槽上不会被顶起来（唯一的"会卡死"的错误）
@@ -2523,6 +2576,14 @@ def test_m8_respawn(app):
            u"%s" % [b.state for b in w.bricks[:4]])
     _check(u"重生后场上没有残留的落石", not w.rocks, u"%d 块" % len(w.rocks))
 
+    _check(u"死亡进了日志（列 + 原因）",
+           len(scene.death_log) == 1
+           and scene.death_log[0][1] == scene.last_death_cause,
+           u"%s" % (scene.death_log,))
+    _check(u"日志记的是死的那一列（第 8~10 列之间）",
+           len(scene.death_log) == 1 and 7 <= scene.death_log[0][0] <= 10,
+           u"%s" % (scene.death_log,))
+
     # 重生点本身不能在机关的触发圈里
     for cp in w.checkpoints:
         cx = cp["spawn"][0] + player.Player.WIDTH // 2
@@ -2530,6 +2591,37 @@ def test_m8_respawn(app):
             _check(u"篝火 %d 列重生点不在落刺的触发圈里" % cp["col"],
                    abs(cx - s.cx) > config.SPIKE_TRIGGER,
                    u"距离 %.0fpx" % abs(cx - s.cx))
+
+
+def test_m8_death_summary(app):
+    _section(u"M8 死因日志与通关汇总")
+
+    scene = _m8_scene(app)
+    p = scene.player
+    for col, cause in ((9, u"掉进深坑"), (9, u"掉进深坑"), (22, u"落刺扎中")):
+        p.teleport(col * config.TILE, 0)
+        scene.death_timer = 0.0
+        scene.die(cause)
+
+    _check(u"三次死亡都记下了", len(scene.death_log) == 3,
+           u"%s" % (scene.death_log,))
+    counts = {}
+    for col, cause in scene.death_log:
+        counts[(col, cause)] = counts.get((col, cause), 0) + 1
+    _check(u"同一处死两次能归成一组", counts.get((9, u"掉进深坑")) == 2,
+           u"%s" % (counts,))
+
+    ok = True
+    try:
+        scene._print_death_summary()        # 开关关着：不打字，也不能报错
+        config.LOG_EVENTS = True
+        scene._print_death_summary()        # 开关开着：打一行
+    except Exception as exc:                # 汇总出错会让通关瞬间崩掉
+        ok = False
+        print(u"        异常：%r" % (exc,))
+    finally:
+        config.LOG_EVENTS = False
+    _check(u"死因汇总在两种开关状态下都不报错", ok, u"")
 
 
 def test_m8_playable(app):

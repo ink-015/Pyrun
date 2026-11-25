@@ -373,6 +373,9 @@ class GameScene(Scene):
         self.last_death_cause = ""
         self.respawn_count = 0
         self.level_time = 0.0
+        # 每次死亡的 (列, 原因)。通关时汇总打一行，比散落的单行更适合调难度：
+        # "第 21 列死了 3 次" 和 "每处各死一次" 是完全不同的两种设计问题。
+        self.death_log = []
         self.toast_text = ""
         self.toast_timer = 0.0
         self.dialog = None
@@ -703,6 +706,24 @@ class GameScene(Scene):
             print(u" 到达终点：%.1fs，金币 %d/%d，死亡 %d 次" % (
                 self.level_time, self.world.taken_coins,
                 self.world.total_coins, self.deaths))
+            self._print_death_summary()
+
+    def _print_death_summary(self):
+        """通关时把死因归一下类，一行打完。
+
+        调难度时关心的不是"死了几次"，而是"是不是同一处反复死"：
+        同一列死三次说明那里要么太难要么读不懂，散在各处各死一次
+        则说明整体偏紧。两种情况的改法完全相反，所以要分开看。
+        """
+        if not config.LOG_EVENTS or not self.death_log:
+            return
+        counts = {}
+        for col, cause in self.death_log:
+            counts[(col, cause)] = counts.get((col, cause), 0) + 1
+        items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0][0]))
+        parts = [u"第 %d 列 %s×%d" % (col, cause, n)
+                 for (col, cause), n in items[:6]]
+        print(u" 死因   : " + u"、".join(parts))
 
     # ---------------------------------------------------------------- 提示
     def toast(self, text, seconds=2.0):
@@ -717,6 +738,12 @@ class GameScene(Scene):
             return
         self.deaths += 1
         self.last_death_cause = cause
+        col = 0 if self.world is None else int(
+            self.player.rect.centerx // config.TILE) + 1
+        self.death_log.append((col, cause))
+        if config.LOG_EVENTS and self.world is not None:
+            print(u" 死亡 %d：%s（第 %d 列，用时 %.1fs）" % (
+                self.deaths, cause, col, self.level_time))
         self.death_timer = config.DEATH_FREEZE
         self.player.vx = 0.0
         self.player.vy = 0.0

@@ -910,7 +910,8 @@ class DropSpike(object):
         self.state = "idle"      # idle → warn → fall → hold → retract
         self.timer = 0.0
         self.tip = self.top_y
-        self.armed = True
+        self.inside = False      # 上一帧人在不在触发圈里（边沿触发用）
+        self.cooldown = 0.0      # 收回之后歇一下，别连着放
         self.t = 0.0
 
     # ---- 运行期 ----
@@ -918,26 +919,36 @@ class DropSpike(object):
         self.state = "idle"
         self.timer = 0.0
         self.tip = self.top_y
-        self.armed = True
+        self.inside = False
+        self.cooldown = 0.0
         self.t = 0.0
 
     def update(self, dt, player=None):
         self.t += dt
+        if self.cooldown > 0.0:
+            self.cooldown = max(0.0, self.cooldown - dt)
+
+        near = player is not None and \
+            abs(player.rect.centerx - self.cx) <= config.SPIKE_TRIGGER
+
         if self.state == "idle":
-            if player is None:
-                return None
-            d = abs(player.rect.centerx - self.cx)
-            if not self.armed:
-                # 走远了才重新上膛：否则站在刺旁边会被反复砸，像卡住了
-                if d > config.SPIKE_TRIGGER + config.TILE:
-                    self.armed = True
-                return None
-            if d <= config.SPIKE_TRIGGER:
+            # 边沿触发：只有"从圈外走进来"那一下才放刺，站在圈里不会连着砸。
+            #
+            # 原来写的是"走远了才重新上膛"（d > 触发距离 + 一格）。这个做法在
+            # 刺与刺相距 3 格（192px）时会留下死区：玩家跑到第 2 座刺的触发圈
+            # 边缘时，离第 1 座只有 58px，远不够 166px，于是第 1 座永远不重新
+            # 上膛；他回头再走过第 1 座时，那把刺已经是摆设了。（玩家实测）
+            # 改成边沿触发后，来回穿行每一次都会重新放刺，也没有死区。
+            if near and not self.inside and self.cooldown <= 0.0:
                 self.state = "warn"
                 self.timer = config.SPIKE_WARN
-                self.armed = False
+                self.cooldown = config.SPIKE_COOLDOWN
+            self.inside = near
             return None
 
+        # 非 idle 状态也要记 inside：否则收回的那一刻人会"被算成刚进来"，
+        # 于是站在原地被无限连砸。
+        self.inside = near
         self.timer -= dt
         if self.state == "warn":
             if self.timer <= 0.0:
@@ -956,7 +967,8 @@ class DropSpike(object):
             if self.tip <= self.top_y:
                 self.tip = self.top_y
                 self.state = "idle"
-                self.timer = config.SPIKE_COOLDOWN
+                self.timer = 0.0
+                self.cooldown = config.SPIKE_COOLDOWN
         return None
 
     def hitbox(self):
@@ -1029,13 +1041,29 @@ class RisingWall(object):
     140px 高，比跳高（127px）高一截，**跳不过去**——这是它存在的理由。
     能跳过去的话它只是个"多按一下跳"的台阶。
 
-    它不杀人，只拦路：升起 0.12 秒、停 0.75 秒、缩回 0.22 秒。
-    所以它考的是"别抢"：看见地上那道槽就知道该收脚，等一下它自己就下去了。
-    和落刺（不许停）刚好相反——两种规则交替出现，玩家才需要读路。
+    升起 0.12 秒、停 0.75 秒、缩回 0.22 秒。
+
+    **朝玩家那一面（左面）长满刺**，撞上去就是死。这是玩家试玩后加的：
+    原来只是"挡住"，撞一下没有任何代价，于是这段路变成"按着右键撞上去，
+    等它落下来再走"——机关读都不用读。加了刺之后，"撞墙"这个错误的代价
+    跟踩空、被砸一样重，玩家才需要真的收脚等一次。
+
+    为了不变成"突然死亡"：槽是提前画在画面上的，墙只用 0.12 秒就长齐，
+    而从触发距离（128px）到墙面以跑速要 0.43 秒，刹车只要 0.11 秒
+    （16px）。也就是说"看见墙起来再停"完全来得及，只有"根本不管"才会撞。
 
     防夹人：升起过程中一旦发现玩家在墙的位置，立刻转成缩回。
     宁可让它"没能升起来"，也不能把人卡进墙里——那是唯一会让人卡死的错。
     """
+
+    def __init__(self, cx, floor_y):
+        self.cx = float(cx)
+        self.floor_y = float(floor_y)
+        self.h = 0.0
+        self.state = "idle"      # idle → rise → hold → retract → wait
+        self.timer = 0.0
+        self.armed = True
+        self.t = 0.0
 
     def __init__(self, cx, floor_y):
         self.cx = float(cx)
@@ -1081,6 +1109,25 @@ class RisingWall(object):
             # 半截墙还能穿过去的话，画面上会像"人从石头里走过去"。
             return self.rect() if self.h >= 4 else None
         return None
+
+    def hitbox(self):
+        """左面那排刺的判定。墙得先长到能挡人的高度才有刺可撞。
+
+        判定带只有 6px 宽，紧贴墙面：碰撞解算会把撞上去的人推到
+        「右边缘 == 墙面」，刚好落在带子里；离墙 6px 以上就算安全。
+        只有左面有刺——玩家是从左边来的，右边长刺只会误导。
+        """
+        if self.state not in ("rise", "hold", "retract"):
+            return None
+        if self.h < config.WALL_READY_H:
+            return None
+        r = self.rect()
+        return pygame.Rect(r.left - config.WALL_SPIKE_LEN, r.top,
+                           config.WALL_SPIKE_LEN + 6, r.h)
+
+    def hits(self, rect):
+        box = self.hitbox()
+        return box is not None and rect.colliderect(box)
 
     def update(self, dt, player=None):
         self.t += dt
@@ -1177,6 +1224,18 @@ class RisingWall(object):
         # 顶面加一道压顶线：墙是从地里顶出来的，顶上该有个"帽"
         pygame.draw.line(surface, config.COLOR_INK, (x, y + 3),
                          (x + r.w, y + 3), 2)
+
+        # 左面一排刺。这是"别撞"的全部信息：墙一起来，朝向玩家的那面
+        # 就是一片锯齿，不需要再配一句说明。
+        step = 14
+        sy = y + 5
+        while sy < y + r.h - 4:
+            pts = [(x + 1, sy),
+                   (x + 1, min(sy + 12, y + r.h - 2)),
+                   (x - config.WALL_SPIKE_LEN, min(sy + 6, y + r.h - 3))]
+            pygame.draw.polygon(surface, (168, 162, 152), pts)
+            pygame.draw.polygon(surface, config.COLOR_INK, pts, 1)
+            sy += step
 
 
 class TwinRock(object):

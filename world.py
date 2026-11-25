@@ -1095,14 +1095,14 @@ class World(object):
 
     # ---- 机关（M7 / M8）----
     def mechanism_hit(self, rect):
-        """会动的致死机关：旋转刺轮 / 荡锤 / 天花板落刺。返回死亡原因或 None。
+        """会动的致死机关：刺轮 / 荡锤 / 天花板落刺 / 突墙的刺。返回死因或 None。
 
         它们和"危险格"分开：危险格是静态的、烘焙在地形上的，这些会动，
         而且判定是"沿臂采样"、"圆心距离"、"只判刺头"，不是矩形相交。
         合并到 hazard_at 里会让那张表看不出哪些格是常驻危险。
 
-        伪装砖和突墙**不在这里**：它们不杀人，只改地形（前者变没，后者变多），
-        所以走的是碰撞表那条路，见 collision_solids()。
+        伪装砖**不在这里**：它不杀人，只改地形（变没），走碰撞表那条路，
+        见 collision_solids()。
         """
         for r in self.rotors:
             if r.hits(rect):
@@ -1113,6 +1113,9 @@ class World(object):
         for s in self.drop_spikes:
             if s.hits(rect):
                 return u"被天花板落刺扎到"
+        for w in self.risers:
+            if w.hits(rect):
+                return u"撞在突墙的刺上"
         return None
 
     def _spawn_rock(self, req):
