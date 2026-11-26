@@ -85,8 +85,12 @@ def build():
     # ---- 金币 ----
     # 前四枚在台阶上，自然引导玩家往上走；19,4 是跳起来才够得到的
     # （站着的头顶在 314，金帀中心 288，不跳吃不到）
+    #
+    # 最后一枚**不能放在终点旗右边**：一脚踩进终点判定区，关卡就结算定格了，
+    # 旗子后面的金币永远拿不到（试玩实测：跑到终点只拿到 8/9）。
+    # 所以终点段的两枚都压在旗子左边，靠小水坑当节奏点。
     for c, r in [(8, 9), (10, 9), (13, 8), (15, 7), (19, 4),
-                 (32, 9), (36, 9), (47, 9), (52, 9)]:
+                 (32, 9), (36, 9), (47, 9), (48, 9)]:
         put(rows, c, r, "c")
 
     return rows
@@ -134,6 +138,18 @@ def check(rows):
         for c in range(W):
             if rows[r][c] == "c" and rows[r][c] == "#":
                 problems.append(u"(%d,%d) 的金币在实心里" % (c, r))
+
+    # 5) 金币不能落在终点旗的右边（含同一列）
+    #    终点判定区一到就结算定格，旗子后面的金币是永远拿不到的：
+    #    玩家会以为自己操作不够，其实是关卡画错了。
+    flag_cols = [c for r in range(H) for c in range(W) if rows[r][c] == "F"]
+    if flag_cols:
+        goal_x = min(flag_cols) * config.TILE
+        for r in range(H):
+            for c in range(W):
+                if rows[r][c] == "c" and c * config.TILE >= goal_x:
+                    problems.append(u"(%d,%d) 的金币在终点（第 %d 列）右边或同一列"
+                                    % (c, r, min(flag_cols)))
 
     return problems
 

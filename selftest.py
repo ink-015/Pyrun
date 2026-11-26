@@ -983,6 +983,50 @@ def test_land_feel():
     _check(u"下沉自动回弹", p.land_sink < 0.01, u"%.3f px" % p.land_sink)
 
 
+# ---------------------------------------------------------------- 关卡数据体检
+
+def test_level_audit():
+    """全关卡"能不能吃到 / 站得住"的体检。
+
+    这类问题**是数据错，不是操作差**，而肉眼看地图看不出来：
+      - 金币画在终点旗右边：一脚踩进终点判定区就结算定格，永远吃不到
+        （试玩两次都报"这关有金币拿不到"，就是这一条）；
+      - 金币埋在实心里：画都画在墙里；
+      - 篝火底下是空的或者泡在水里：重生直接在死亡格上。
+    全都用世界坐标和判定区比一遍，比再看十遍地图靠谱。
+    """
+    _section(u"全关卡结算体检（金币 / 篝火）")
+    for i in range(levels_catalog.count()):
+        lv = levels_catalog.at(i)
+        path = levels_catalog.path_of(lv["key"])
+        w = world.World.load(path)
+        name = lv["name"]
+
+        past = [c for c in w.coins if c["rect"].right > w.goal_zone.left]
+        _check(u"%s 没有金币落在终点之后" % name, not past,
+               u"%d/%d 枚越过终点（x>%d）"
+               % (len(past), len(w.coins), w.goal_zone.left))
+
+        buried = [c for c in w.coins
+                  if any(r.colliderect(c["rect"]) for r in w.solids)]
+        _check(u"%s 没有金币埋在实心里" % name, not buried,
+               u"%d 枚" % len(buried))
+
+        in_hazard = [c for c in w.coins if w.hazard_at(c["rect"]) is not None]
+        _check(u"%s 没有金币压在危险格上" % name, not in_hazard,
+               u"%d 枚" % len(in_hazard))
+
+        bad = []
+        for cp in w.checkpoints:
+            r = cp["rect"]
+            if not w.is_solid_px(r.centerx, r.bottom + 2):
+                bad.append(u"悬空")
+            elif w.hazard_at(r) is not None:
+                bad.append(u"泡在危险格里")
+        _check(u"%s 篝火重生点都站在实地上" % name, not bad,
+               u"、".join(bad) or u"%d 个全好" % len(w.checkpoints))
+
+
 # ---------------------------------------------------------------- M3 地图与相机
 
 def _temp_level(name, text):
@@ -3078,6 +3122,7 @@ def _run_all(app):
     test_m9_goal(app)
     test_level_parse()
     test_level_errors()
+    test_level_audit()
     test_camera()
     test_level_playable()
 

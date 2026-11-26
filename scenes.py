@@ -1160,6 +1160,15 @@ class GameScene(Scene):
             print(u" 到达终点：%.1fs，金币 %d/%d，死亡 %d 次" % (
                 self.level_time, self.world.taken_coins,
                 self.world.total_coins, self.deaths))
+            # 漏拿的金币是哪几枚，必须打出来。试玩反馈"这关有金币拿不到"
+            # 时，光看总数 10/12 没法判断是"没跳够"还是"画在拿不到的地方"——
+            # 把列号列出来，一眼就能定位（列号从 1 开始，和死因那份一致）。
+            missed = [c for c in self.world.coins if not c["taken"]]
+            if missed:
+                missed.sort(key=lambda c: c["rect"].centerx)
+                print(u" 漏拿     : %s（共 %d 枚）" % (
+                    u"、".join(u"第 %d 列" % (c["rect"].centerx // config.TILE + 1)
+                              for c in missed), len(missed)))
             self._print_death_summary()
             self._record_result()
 
