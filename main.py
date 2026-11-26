@@ -20,6 +20,7 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-m6      第 4 关：NPC 对话 / 蝙蝠走廊 / 落石三张图
     python main.py --smoke-m7      第 5 关：踩怪 / 刺轮 / 荡锤 / 空中伞四张图
     python main.py --smoke-m8      第 6 关：伪装砖 / 落刺 / 突墙 / 二连石四张图
+    python main.py --smoke-m9      界面四张图：主菜单 / 选关 / 暂停 / 结算
     python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -40,7 +41,9 @@ import pygame
 import assets
 import compat
 import config
+import levels_catalog
 import player
+import save as save_mod
 import scenes
 import selftest
 
@@ -52,6 +55,10 @@ class App(object):
         self.screen = None
         self.clock = None
         self.scenes = None
+        # 存档由 App 持有：场景只读它、只在通关时写它。
+        # 不能让每个场景自己 new 一个——那样两个存档对象各自持有不同的
+        # 内存副本，谁后写谁覆盖，进度会莫名其妙丢。
+        self.save = None
         self.running = True
 
     def quit(self):
@@ -305,8 +312,16 @@ def main():
     app = App()
     app.screen = screen
     app.clock = clock
+    # 截图与自检会人为制造"通关"，一律只读，绝不写玩家的 save.json。
+    readonly = any(a.startswith("--smoke") for a in sys.argv) or "--selftest" in sys.argv
+    app.save = save_mod.Save(readonly=readonly)
+    if app.save.warnings:
+        for w in app.save.warnings:
+            print(u" 存档     : %s" % w)
+    print(u" 存档     : %s（%s）" % (app.save.path, app.save.summary()))
     app.scenes = scenes.SceneManager(app)
     app.scenes.register("menu", scenes.MenuScene)
+    app.scenes.register("select", scenes.LevelSelectScene)
     app.scenes.register("game", scenes.GameScene)
     app.scenes.start("menu")
 
@@ -736,6 +751,59 @@ def main():
         pygame.quit()
         return 0
 
+    if "--smoke-m9" in sys.argv:
+        # M9 的四张界面图：主菜单 / 选关 / 暂停 / 结算。
+        # 存档在 main 开头就按 --smoke* 判定为只读，这里注入的进度只活在
+        # 内存里，不会把假成绩写进 save.json。
+        sv = app.save
+        sv.levels = {}
+        sv.record("l1", 37.0, 10, 12, 2)
+        sv.record("l2", 42.5, 11, 11, 0)
+
+        app.scenes.start("menu")
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 菜单     : %s" % [l for l, _ in app.scenes.current.items])
+        print(" 截图   :", save_screenshot(screen, "m9_menu.png"))
+
+        app.scenes.goto("select")
+        app.scenes.update(config.FIXED_DT)
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 选关     : 光标停在第 %d 张（第一个未通关的）"
+              % (app.scenes.current.index + 1))
+        print(" 截图   :", save_screenshot(screen, "m9_select.png"))
+
+        # 暂停：挑第 3 关，画面里有滑翔伞和水池，一眼能看出"世界停住了"
+        app.level_path = levels_catalog.path_of("l3")
+        app.scenes.goto("game")
+        app.scenes.update(config.FIXED_DT)
+        scene = app.scenes.current
+        for _ in range(12):
+            app.scenes.update(config.FIXED_DT)
+        scene.paused = True
+        scene.pause_index = 1
+        scene.invuln = 0.0
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 暂停     : paused=%s" % scene.paused)
+        print(" 截图   :", save_screenshot(screen, "m9_pause.png"))
+
+        # 结算：直接传进终点，走一遍真实的判定与存档（只读）
+        scene.paused = False
+        g = scene.world.goal_zone
+        scene.player.teleport(g.centerx - scene.player.WIDTH // 2,
+                              g.centery - scene.player.HEIGHT // 2)
+        scene._post_physics()
+        scene.invuln = 0.0
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 结算     : goal=%s next=%s rec=%s"
+              % (scene.goal_reached, scene.next_key, scene.new_record))
+        print(" 截图   :", save_screenshot(screen, "m9_goal.png"))
+        pygame.quit()
+        return 0
+
     if "--smoke-run" in sys.argv:
         # 连续截取跑动中的角色，拼成一条，用于肉眼判断动作是否连贯。
         # 这里刻意用纯平地面而不是 GameScene 的灰盒地形：
@@ -814,6 +882,11 @@ def main():
         return code
 
     # ---- 固定步长主循环 ----
+    # --level 指定关卡时直接进关，跳过菜单。给试玩和截图脚本用的快速通道，
+    # 顺带绕过"解锁"——否则想看一眼第 6 关，得先把前五关打通。
+    if "--level" in sys.argv:
+        app.scenes.start("game")
+
     show_fps = "--fps" in sys.argv
     fps_timer = 0.0
     accumulator = 0.0

@@ -19,7 +19,9 @@ import config
 import dialog
 import enemy
 import io_utils
+import levels_catalog
 import player
+import save as save_mod
 import scenes
 import world
 
@@ -98,8 +100,22 @@ def test_scenes(app):
     pygame.display.flip()
     _check(u"游戏场景可渲染", True, u"已绘制一帧")
 
+    # M9 起 Esc 不再直接退菜单，而是打开暂停面板——直接退会把这一局的
+    # 检查点、金币、机关状态全丢掉，按一下 Esc 就白跑十分钟。
     app.scenes.handle_events([_key(pygame.K_ESCAPE)])
-    _check(u"Esc 返回菜单", app.scenes.current_name == "menu",
+    paused = app.scenes.current_name == "game" and app.scenes.current.paused
+    _check(u"Esc 打开暂停面板", paused,
+           u"当前=%s paused=%s" % (app.scenes.current_name,
+                                   getattr(app.scenes.current, "paused", None)))
+    app.scenes.draw(app.screen)
+    pygame.display.flip()
+    _check(u"暂停面板可渲染", True, u"已绘制一帧")
+
+    # 从暂停面板回主菜单
+    game = app.scenes.current
+    game.pause_index = len(game.PAUSE_ITEMS) - 1
+    app.scenes.handle_events([_key(pygame.K_RETURN)])
+    _check(u"暂停面板可回菜单", app.scenes.current_name == "menu",
            u"当前=%s" % app.scenes.current_name)
 
     menu = app.scenes.current
@@ -2658,6 +2674,338 @@ def test_m8_playable(app):
           % (frames * DT, w.taken_coins, w.total_coins, scene.deaths))
 
 
+# ---------------------------------------------------------------- M9 存档与界面
+
+def test_m9_save():
+    _section(u"M9 存档：读写、纪录、解锁")
+
+    tmp = os.path.join(tempfile.mkdtemp(prefix="pyrun_save_"), "s.json")
+    sv = save_mod.Save(tmp)
+    _check(u"没有存档时按新玩家处理",
+           sv.cleared_count() == 0 and not sv.all_unlocked)
+    _check(u"第一关默认解锁", sv.unlocked("l1"))
+    _check(u"第二关默认锁着", not sv.unlocked("l2"))
+
+    rec = sv.record("l1", 40.0, 8, 12, 3)
+    _check(u"首次通关记为新纪录",
+           rec.get("first") and rec.get("time"), u"%s" % (rec,))
+    _check(u"通关后下一关解锁", sv.unlocked("l2"))
+    _check(u"文件已落盘", os.path.isfile(tmp))
+
+    rec = sv.record("l1", 45.0, 10, 12, 1)
+    _check(u"更慢的一局不刷新时间",
+           not rec.get("time") and sv.best_time("l1") == 40.0,
+           u"best=%.1f rec=%s" % (sv.best_time("l1"), rec))
+    _check(u"金币更多会刷新", rec.get("coins") and sv.best_coins("l1") == 10,
+           u"coins=%d" % sv.best_coins("l1"))
+
+    rec = sv.record("l1", 38.0, 6, 12, 5)
+    _check(u"更快的一局刷新时间",
+           rec.get("time") and sv.best_time("l1") == 38.0,
+           u"best=%.1f" % sv.best_time("l1"))
+
+    sv2 = save_mod.Save(tmp)
+    _check(u"重新读盘成绩一致",
+           sv2.best_time("l1") == 38.0 and sv2.is_cleared("l1"),
+           u"%s" % (sv2.entry("l1"),))
+    _check(u"解锁状态也持久", sv2.unlocked("l2"))
+
+    # 关卡后来加了金币（11 → 14 枚）：旧的 11/11 不能跟新的比大小
+    sv.record("l1", 38.0, 5, 14, 0)
+    _check(u"金币总数变了就作废旧记录", sv.best_coins("l1") == 5,
+           u"coins=%d total=%d" % (sv.best_coins("l1"),
+                                   sv.entry("l1").get("total")))
+
+    sv.record("l1", 39.0, 14, 14, 0)
+    _check(u"满金币算完美", sv.perfect("l1"))
+    _check(u"完美要求先通关", not sv.perfect("l2"))
+
+    sv.set_all_unlocked(True)
+    _check(u"全解锁开关生效并落盘",
+           sv.unlocked("l6") and save_mod.Save(tmp).unlocked("l6"))
+
+    # ---- 坏存档：三条都不能抛，只能"退化成新玩家 + 留一句警告" ----
+    io_utils.write_text(tmp, "{ 这不是 json")
+    bad = save_mod.Save(tmp)
+    _check(u"坏 JSON 不崩、按新玩家处理", bad.cleared_count() == 0)
+
+    io_utils.write_text(tmp, u'{"version": 1, "levels": [1, 2, 3]}')
+    bad = save_mod.Save(tmp)
+    _check(u"levels 类型错不崩且记警告",
+           bad.cleared_count() == 0 and bool(bad.warnings),
+           u"warnings=%s" % bad.warnings)
+
+    io_utils.write_text(tmp, u'{"version": 1, "levels": {"l9": {"cleared": true}}}')
+    bad = save_mod.Save(tmp)
+    _check(u"不认识的关卡被丢掉并记警告",
+           bad.cleared_count() == 0 and bool(bad.warnings),
+           u"warnings=%s" % bad.warnings)
+
+    io_utils.write_text(tmp, u'{"version": 1, "levels": {"l1": {"cleared": true,'
+                             u' "time": "很快", "coins": -3}}}')
+    bad = save_mod.Save(tmp)
+    _check(u"单个坏字段不带走整条记录",
+           bad.is_cleared("l1") and bad.best_time("l1") is None
+           and bad.best_coins("l1") == -1,
+           u"%s" % (bad.entry("l1"),))
+
+
+def test_m9_catalog():
+    _section(u"M9 关卡目录")
+
+    _check(u"目录里有六关", levels_catalog.count() == 6,
+           u"%d 关" % levels_catalog.count())
+    _check(u"关卡文件都在", not levels_catalog.missing_files(),
+           u"缺：%s" % levels_catalog.missing_files())
+    _check(u"key 不重复",
+           len(set(lv["key"] for lv in levels_catalog.LEVELS))
+           == levels_catalog.count())
+    _check(u"路径反查 key",
+           levels_catalog.path_to_key(os.path.join(config.LEVEL_DIR, "l4.txt"))
+           == "l4")
+    _check(u"最后一关没有下一关",
+           levels_catalog.next_of("l6") is None)
+    _check(u"第四关的下一关是第五关",
+           levels_catalog.next_of("l4")["key"] == "l5")
+
+
+def test_m9_select(app):
+    _section(u"M9 关卡选择界面")
+
+    app.save.clear()
+    sel = scenes.LevelSelectScene(app)
+    sel.on_enter()
+    _check(u"渲染六张卡片", len(sel._cards) == 6, u"%d 张" % len(sel._cards))
+    sel.draw(app.screen)
+    pygame.display.flip()
+    _check(u"选关界面可渲染（含锁与对勾）", True, u"已绘制一帧")
+    _check(u"默认光标在第一个未通关的关", sel.index == 0, u"index=%d" % sel.index)
+
+    # 方向键按网格走
+    sel.handle_event(_key(pygame.K_RIGHT))
+    _check(u"→ 移到下一列", sel.index == 1, u"index=%d" % sel.index)
+    sel.handle_event(_key(pygame.K_DOWN))
+    _check(u"↓ 跨一行 +3", sel.index == 4, u"index=%d" % sel.index)
+    sel.handle_event(_key(pygame.K_DOWN))
+    _check(u"最后一行按 ↓ 不动", sel.index == 4, u"index=%d" % sel.index)
+    sel.handle_event(_key(pygame.K_LEFT))
+    sel.handle_event(_key(pygame.K_LEFT))
+    _check(u"第一列按 ← 不动", sel.index == 3, u"index=%d" % sel.index)
+
+    # 锁着的关卡进不去
+    sel.index = 3
+    ok = sel._activate()
+    _check(u"锁着的关卡进不去",
+           not ok and app.scenes._pending is None and bool(sel.notice),
+           u"ok=%s notice=%s" % (ok, sel.notice))
+
+    # 通关三关之后，第四关开锁，光标也自动顶过去
+    for k in ("l1", "l2", "l3"):
+        app.save.record(k, 30.0, 5, 10, 0)
+    sel.on_enter()
+    _check(u"通关后光标推进到下一关", sel.index == 3, u"index=%d" % sel.index)
+    sel.index = 3
+    ok = sel._activate()
+    _check(u"解锁后能进入", ok and app.scenes._pending == "game",
+           u"pending=%s" % app.scenes._pending)
+    _check(u"进的是第四关",
+           os.path.basename(app.level_path) == "l4.txt", app.level_path)
+    app.scenes._pending = None        # 别把切换带进后面的用例
+
+    # F2 全解锁
+    sel.handle_event(_key(pygame.K_F2))
+    _check(u"F2 一键全解锁", app.save.unlocked("l6") and sel.notice,
+           u"notice=%s" % sel.notice)
+
+    # 清档要按两次
+    sel.handle_event(_key(pygame.K_DELETE))
+    _check(u"第一次 Delete 只提示不清档",
+           sel._confirm_clear and app.save.cleared_count() == 3,
+           u"confirm=%s 已通关 %d" % (sel._confirm_clear, app.save.cleared_count()))
+    sel.handle_event(_key(pygame.K_DELETE))
+    _check(u"第二次 Delete 才真的清空",
+           not sel._confirm_clear and app.save.cleared_count() == 0,
+           u"已通关 %d" % app.save.cleared_count())
+
+    # 确认窗口会自己过期：等它超时后，单按一次不能清档
+    app.save.record("l1", 10.0, 1, 10, 0)
+    sel.handle_event(_key(pygame.K_DELETE))
+    for _ in range(200):
+        sel.update(DT)
+    sel.handle_event(_key(pygame.K_DELETE))
+    _check(u"确认窗口过期后不会误清档",
+           app.save.cleared_count() == 1 and sel._confirm_clear,
+           u"已通关 %d confirm=%s" % (app.save.cleared_count(),
+                                      sel._confirm_clear))
+
+
+def test_m9_menu(app):
+    _section(u"M9 主菜单随进度变化")
+
+    app.save.clear()
+    menu = scenes.MenuScene(app)
+    menu.on_enter()
+    _check(u"新玩家显示「开始游戏」",
+           menu.items[0][0] == u"开始游戏", menu.items[0][0])
+    _check(u"菜单三项", len(menu.items) == 3, u"%s" % (menu.items,))
+
+    app.save.record("l1", 30.0, 10, 12, 0)
+    app.save.record("l2", 30.0, 10, 12, 0)
+    menu.on_enter()
+    _check(u"有进度后显示「继续游戏」",
+           u"继续游戏" in menu.items[0][0] and u"滑翔伞" in menu.items[0][0],
+           menu.items[0][0])
+    _check(u"「开始游戏」直接进未通关的关",
+           menu.items[0][1] == "play")
+
+    # 点"开始游戏"应该落到第三关
+    app.save.clear()
+    app.save.record("l1", 30.0, 10, 12, 0)
+    menu.on_enter()
+    menu.index = 0
+    menu._activate()
+    _check(u"进入的是第一个未通关的关",
+           os.path.basename(app.level_path) == "l2.txt", app.level_path)
+    app.scenes._pending = None
+
+
+def test_m9_pause(app):
+    _section(u"M9 暂停面板")
+
+    app.save.clear()
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(config.DEFAULT_LEVEL)
+    scene.override_axis = 1.0
+    for _ in range(20):
+        scene.update(DT)
+    t0 = scene.level_time
+    x0 = scene.player.x
+    y0 = scene.player.y
+
+    scene.handle_event(_key(pygame.K_ESCAPE))
+    _check(u"Esc 打开暂停", scene.paused and scene.pause_index == 0)
+    scene.draw(app.screen)
+    pygame.display.flip()
+    _check(u"暂停面板可渲染", True, u"已绘制一帧")
+
+    # 暂停期间：计时不走、角色不动、世界不推进
+    w0 = scene.world.time
+    for _ in range(60):
+        scene.update(DT)
+    _check(u"暂停时计时不走", abs(scene.level_time - t0) < 1e-9,
+           u"%.3f → %.3f" % (t0, scene.level_time))
+    _check(u"暂停时角色不动", abs(scene.player.x - x0) < 0.01,
+           u"%.1f → %.1f" % (x0, scene.player.x))
+    _check(u"暂停时世界也不推进", abs(scene.world.time - w0) < 1e-9,
+           u"%.3f → %.3f" % (w0, scene.world.time))
+
+    # 暂停时按空格是"确认当前项"，不是跳。当前项是"继续游戏"，
+    # 所以空格的效果是关掉暂停——但角色一毫米都不能动。
+    scene.handle_event(_key(pygame.K_SPACE))
+    _check(u"暂停里按空格是确认不是跳",
+           not scene.paused and abs(scene.player.y - y0) < 0.01
+           and abs(scene.player.vy) < 0.01,
+           u"paused=%s y=%.1f vy=%.1f" % (scene.paused, scene.player.y,
+                                          scene.player.vy))
+
+    # 继续之后计时恢复
+    for _ in range(10):
+        scene.update(DT)
+    _check(u"关掉暂停后继续计时", scene.level_time > t0,
+           u"%.3f" % scene.level_time)
+
+    # Esc 再按一次：打开再关掉
+    scene.handle_event(_key(pygame.K_ESCAPE))
+    scene.handle_event(_key(pygame.K_ESCAPE))
+    _check(u"Esc 可以关掉暂停", not scene.paused)
+
+    # "重开本关"
+    scene.deaths = 2
+    scene.handle_event(_key(pygame.K_ESCAPE))
+    scene.pause_index = 1
+    scene.handle_event(_key(pygame.K_RETURN))
+    _check(u"暂停里重开本关",
+           not scene.paused and scene.level_time == 0.0 and scene.deaths == 0,
+           u"paused=%s t=%.2f d=%d" % (scene.paused, scene.level_time,
+                                       scene.deaths))
+
+    # "选择关卡"
+    scene.handle_event(_key(pygame.K_ESCAPE))
+    scene.pause_index = 2
+    scene.handle_event(_key(pygame.K_RETURN))
+    _check(u"暂停里能去选关", app.scenes._pending == "select",
+           u"pending=%s" % app.scenes._pending)
+    app.scenes._pending = None
+
+
+def _m9_touch_goal(scene):
+    """把角色传进终点区并立刻跑一次判定，模拟"跑到终点"。"""
+    g = scene.world.goal_zone
+    scene.player.teleport(g.centerx - player.Player.WIDTH // 2,
+                          g.centery - player.Player.HEIGHT // 2)
+    scene._post_physics()
+
+
+def test_m9_goal(app):
+    _section(u"M9 结算面板与连续挑战")
+
+    app.save.clear()
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(config.DEFAULT_LEVEL)
+    for _ in range(10):
+        scene.update(DT)
+    scene.world.taken_coins = 7
+    _m9_touch_goal(scene)
+
+    _check(u"碰到终点判定为通关", scene.goal_reached)
+    scene.draw(app.screen)
+    pygame.display.flip()
+    _check(u"结算面板可渲染", True, u"已绘制一帧")
+    _check(u"通关立刻写进存档", app.save.is_cleared("l1"),
+           u"%s" % (app.save.entry("l1"),))
+    _check(u"记下了下一关", scene.next_key == "l2", scene.next_key)
+    _check(u"首次通关标记为新纪录", bool(scene.new_record.get("first")),
+           u"%s" % (scene.new_record,))
+    _check(u"成绩里带着金币数",
+           app.save.best_coins("l1") == 7,
+           u"coins=%d" % app.save.best_coins("l1"))
+
+    # Enter：连续挑战，直接进下一关
+    scene.handle_event(_key(pygame.K_RETURN))
+    _check(u"Enter 直接进下一关",
+           app.scenes._pending == "game"
+           and os.path.basename(app.level_path) == "l2.txt",
+           u"pending=%s path=%s" % (app.scenes._pending, app.level_path))
+    app.scenes._pending = None
+
+    # R：重来本关
+    scene.handle_event(_key(pygame.K_r))
+    _check(u"R 重来本关",
+           not scene.goal_reached and scene.level_time == 0.0,
+           u"goal=%s t=%.2f" % (scene.goal_reached, scene.level_time))
+
+    # 最后一关：没有下一关，Enter 回选关
+    scene2 = scenes.GameScene(app)
+    scene2.load_level(levels_catalog.path_of("l6"))
+    _m9_touch_goal(scene2)
+    _check(u"最后一关没有下一关", scene2.next_key == "", scene2.next_key)
+    scene2.handle_event(_key(pygame.K_RETURN))
+    _check(u"最后一关 Enter 回选关", app.scenes._pending == "select",
+           u"pending=%s" % app.scenes._pending)
+    app.scenes._pending = None
+
+    # Esc：选关（不是"返回菜单"，那是两回事）
+    scene3 = scenes.GameScene(app)
+    scene3.load_level(config.DEFAULT_LEVEL)
+    _m9_touch_goal(scene3)
+    scene3.handle_event(_key(pygame.K_ESCAPE))
+    _check(u"结算面板 Esc 去选关", app.scenes._pending == "select",
+           u"pending=%s" % app.scenes._pending)
+    app.scenes._pending = None
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -2673,10 +3021,17 @@ def run(app):
     # 试玩时一行死因都没打出来，查了半天才发现是这里。
     saved_log = config.LOG_EVENTS
     config.LOG_EVENTS = False
+    # 自检会真的跑到终点（好几关），不能把成绩写进玩家自己的 save.json。
+    # 换一份临时存档，跑完再换回来——和上面的事件日志是同一个道理：
+    # 被调用的模块不许留下副作用。
+    real_save = app.save
+    tmp_dir = tempfile.mkdtemp(prefix="pyrun_selftest_")
+    app.save = save_mod.Save(os.path.join(tmp_dir, "save.json"))
     try:
         return _run_all(app)
     finally:
         config.LOG_EVENTS = saved_log
+        app.save = real_save
 
 
 def _run_all(app):
@@ -2715,6 +3070,12 @@ def _run_all(app):
     test_m8_twin(app)
     test_m8_respawn(app)
     test_m8_playable(app)
+    test_m9_save()
+    test_m9_catalog()
+    test_m9_menu(app)
+    test_m9_select(app)
+    test_m9_pause(app)
+    test_m9_goal(app)
     test_level_parse()
     test_level_errors()
     test_camera()

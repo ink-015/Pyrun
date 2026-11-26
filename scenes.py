@@ -22,6 +22,7 @@ import assets
 import compat
 import config
 import dialog
+import levels_catalog
 import player
 import world
 
@@ -187,13 +188,65 @@ class SceneManager(object):
             self._current.draw(surface)
 
 
+# ---------------------------------------------------------------- 通用小件
+
+def draw_menu_list(surface, rects, labels, index, font_obj):
+    """竖排菜单的统一画法：选中项描边框 + 左侧手绘箭头。
+
+    主菜单和暂停面板共用它。两边各写一遍的话，"选中长什么样"会慢慢
+    变成两种风格，玩家得学两次。
+    """
+    for i, label in enumerate(labels):
+        rect = rects[i]
+        selected = (i == index)
+        if selected:
+            compat.rounded_rect(surface, config.COLOR_INK, rect, radius=12, width=3)
+            ax = rect.left - 34
+            ay = rect.centery
+            pygame.draw.lines(surface, config.COLOR_INK, False,
+                              [(ax - 10, ay - 9), (ax, ay), (ax - 10, ay + 9)], 3)
+        color = config.COLOR_INK if selected else config.COLOR_MUTED
+        text = font_obj.render(label, True, color)
+        surface.blit(text, (rect.centerx - text.get_width() // 2,
+                            rect.centery - text.get_height() // 2))
+
+
+def draw_check_mark(surface, cx, cy, size=9, color=(94, 148, 106)):
+    """手绘对勾。不用 emoji：中文字体里不一定有 ✗ 的字形。"""
+    pygame.draw.lines(surface, color, False,
+                      [(cx - size, cy), (cx - size * 0.3, cy + size * 0.8),
+                       (cx + size, cy - size * 0.9)], 3)
+
+
+def draw_lock(surface, cx, cy, color):
+    """一把小锁：拱形锁梁 + 方锁身。未解锁的关卡卡片靠它一眼认出来。"""
+    pygame.draw.arc(surface, color, pygame.Rect(cx - 6, cy - 11, 12, 14),
+                    0.0, math.pi, 2)
+    body = pygame.Rect(cx - 7, cy - 2, 14, 12)
+    compat.rounded_rect(surface, color, body, radius=3, width=2)
+
+
+def enter_level(app, key):
+    """从任意界面进入某一关。**只有这一个入口**，不要在别处直接改
+    app.level_path 再 goto("game")——散着写的话，以后加"进关前重置什么"
+    就得改七八个地方。
+    """
+    lv = levels_catalog.get(key)
+    if lv is None:
+        return False
+    app.level_path = levels_catalog.path_of(lv)
+    app.scenes.goto("game")
+    return True
+
+
 # ---------------------------------------------------------------- 菜单场景
 
 class MenuScene(Scene):
-    """主菜单。M1 只有"开始游戏"和"退出游戏"两项。"""
+    """主菜单。项目列表随存档变化：第一次玩是"开始游戏"，
+    打了一半是"继续游戏 · 第 N 关"。
+    """
 
     name = "menu"
-    ITEMS = [("开始游戏", "game"), ("退出游戏", "quit")]
 
     TITLE_SIZE = 64
     ITEM_SIZE = 28
@@ -201,16 +254,30 @@ class MenuScene(Scene):
     def __init__(self, app):
         Scene.__init__(self, app)
         self.index = 0
+        self.items = []
         self._bg = None
         self._item_rects = []
 
     def on_enter(self):
         self.index = 0
+        self.items = self._build_items()
         self._bg = self._build_background()
         self._item_rects = self._build_item_rects()
 
     def on_exit(self):
         self._bg = None
+
+    def _build_items(self):
+        """菜单项依赖存档：不能写成类常量，否则"继续游戏"永远指第一关。"""
+        sv = self.app.save
+        nxt = sv.first_uncleared()
+        if sv.cleared_count() == 0:
+            play = u"开始游戏"
+        elif sv.all_cleared():
+            play = u"再玩一次"
+        else:
+            play = u"继续游戏 · %s" % nxt["name"]
+        return [(play, "play"), (u"选择关卡", "select"), (u"退出游戏", "quit")]
 
     def _build_background(self):
         """标题与纸底是静态的，渲染一次缓存起来，每帧只 blit。"""
@@ -230,15 +297,24 @@ class MenuScene(Scene):
         sw = f_sub.size(sub)[0]
         bg.blit(f_sub.render(sub, True, config.COLOR_MUTED),
                 ((config.WIDTH - sw) // 2, 200))
+
+        # 进度条：让"我打到哪了"在菜单上就能看见，不必点进选关界面
+        f_p, _ = get_font(17)
+        prog = self.app.save.summary()
+        pw = f_p.size(prog)[0]
+        bg.blit(f_p.render(prog, True, config.COLOR_MUTED),
+                ((config.WIDTH - pw) // 2, 236))
         return bg
 
     def _build_item_rects(self):
         """计算每个菜单项的可点击区域，鼠标与键盘共用同一套坐标。"""
         rects = []
         f_name, _ = get_font(self.ITEM_SIZE)
-        top = 300
-        gap = 74
-        for i, (label, _) in enumerate(self.ITEMS):
+        # 三项要算着放：292 + 2*66 + 54 = 478，底部提示条在 500，
+        # 原来按两项写的 300/74 会让"退出游戏"压到提示上。
+        top = 292
+        gap = 66
+        for i, (label, _) in enumerate(self.items):
             w = f_name.size(label)[0] + 120
             h = 54
             rects.append(pygame.Rect((config.WIDTH - w) // 2, top + i * gap, w, h))
@@ -246,10 +322,11 @@ class MenuScene(Scene):
 
     def handle_event(self, event):
         if event.type == pygame.KEYDOWN:
+            n = len(self.items)
             if event.key in (pygame.K_UP, pygame.K_w):
-                self.index = (self.index - 1) % len(self.ITEMS)
+                self.index = (self.index - 1) % n
             elif event.key in (pygame.K_DOWN, pygame.K_s):
-                self.index = (self.index + 1) % len(self.ITEMS)
+                self.index = (self.index + 1) % n
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
                 self._activate()
             elif event.key == pygame.K_ESCAPE:
@@ -268,9 +345,11 @@ class MenuScene(Scene):
         return False
 
     def _activate(self):
-        label, action = self.ITEMS[self.index]
+        _, action = self.items[self.index]
         if action == "quit":
             self.app.quit()
+        elif action == "play":
+            enter_level(self.app, self.app.save.first_uncleared()["key"])
         else:
             self.app.scenes.goto(action)
 
@@ -278,26 +357,289 @@ class MenuScene(Scene):
         surface.blit(self._bg, (0, 0))
         f_item, _ = get_font(self.ITEM_SIZE)
         f_hint, _ = get_font(17)
-
-        for i, (label, _) in enumerate(self.ITEMS):
-            rect = self._item_rects[i]
-            selected = (i == self.index)
-            if selected:
-                # 选中项：虚线圆角框 + 左侧手绘箭头
-                compat.rounded_rect(surface, config.COLOR_INK, rect, radius=12, width=3)
-                ax = rect.left - 34
-                ay = rect.centery
-                pygame.draw.lines(surface, config.COLOR_INK, False,
-                                  [(ax - 10, ay - 9), (ax, ay), (ax - 10, ay + 9)], 3)
-            color = config.COLOR_INK if selected else config.COLOR_MUTED
-            text = f_item.render(label, True, color)
-            surface.blit(text, (rect.centerx - text.get_width() // 2,
-                                rect.centery - text.get_height() // 2))
+        draw_menu_list(surface, self._item_rects,
+                       [label for label, _ in self.items],
+                       self.index, f_item)
 
         hint = u"↑↓ 选择    Enter 确定    Esc 退出"
         hw = f_hint.size(hint)[0]
         surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
-                     ((config.WIDTH - hw) // 2, config.HEIGHT - 56))
+                     ((config.WIDTH - hw) // 2, config.HEIGHT - 40))
+
+
+# ---------------------------------------------------------------- 选关场景
+
+class LevelSelectScene(Scene):
+    """关卡选择。卡片上带成绩与锁。
+
+    布局是 3 列网格，方向键按网格走（上下跨一行 = ±3）。不做"跳过空位"
+    的特殊处理：6 关刚好两整行，按网格走永远不会踩空；以后加到 7 关
+    也只会多出一个空位，那时再改。
+    """
+
+    name = "select"
+
+    COLS = 3
+    CARD_W = 280
+    CARD_H = 140
+    GAP_X = 24
+    GAP_Y = 20
+    TOP = 148
+
+    def __init__(self, app):
+        Scene.__init__(self, app)
+        self.index = 0
+        self._bg = None
+        self._cards = []
+        self.notice = ""
+        self.notice_timer = 0.0
+
+    def on_enter(self):
+        self._bg = self._build_background()
+        self._cards = self._build_cards()
+        self.notice = ""
+        self.notice_timer = 0.0
+        # Delete 清档要按两次。一次就清的话，手滑一下十年进度没了。
+        self._confirm_clear = False
+        self._card_imgs = []
+        self.index = self._default_index()
+        self._rebuild_cards()
+
+    def on_exit(self):
+        self._bg = None
+
+    def _rebuild_cards(self):
+        """把六张卡片各自渲染成一张小图缓存起来（普通 / 选中两版）。
+
+        不缓存的话每帧要画 6 个抗锯齿面板（1.4ms/个）＋ 24 次文字渲染，
+        实测 9.25ms/帧——离 16.7ms 预算只剩一半余量，海龟机上会掉帧。
+        卡片只在存档变化时才会变，所以缓存是安全的；改存档之后记得调
+        本函数重建（清档、F2 全解锁两处）。
+        """
+        self._card_imgs = []
+        for i, rect in enumerate(self._cards):
+            lv = levels_catalog.at(i)
+            if lv is None:
+                self._card_imgs.append(None)
+                continue
+            pair = []
+            for selected in (False, True):
+                # 留 4px 边距：panel 的描边与抗锯齿可能压到边界外一像素
+                surf = pygame.Surface((rect.w + 8, rect.h + 8), pygame.SRCALPHA)
+                self._draw_card(surf, pygame.Rect(4, 4, rect.w, rect.h),
+                                lv, selected)
+                pair.append(surf)
+            self._card_imgs.append(pair)
+
+    def _default_index(self):
+        """光标落在第一个没通关的关上：刚打完第 N 关进来，下一步多半是 N+1。"""
+        nxt = self.app.save.first_uncleared()
+        i = levels_catalog.index_of(nxt["key"])
+        return max(0, min(i, len(self._cards) - 1))
+
+    def _build_background(self):
+        bg = pygame.Surface((config.WIDTH, config.HEIGHT))
+        draw_paper(bg)
+        f_title, _ = get_font(38, bold=True)
+        title = u"选择关卡"
+        tw = f_title.size(title)[0]
+        bg.blit(f_title.render(title, True, config.COLOR_INK),
+                ((config.WIDTH - tw) // 2, 56))
+        draw_sketch_underline(bg, (config.WIDTH - tw) // 2 + 8,
+                              (config.WIDTH + tw) // 2 - 8, 108)
+        f_sub, _ = get_font(17)
+        sub = self.app.save.summary()
+        sw = f_sub.size(sub)[0]
+        bg.blit(f_sub.render(sub, True, config.COLOR_MUTED),
+                ((config.WIDTH - sw) // 2, 116))
+        return bg
+
+    def _build_cards(self):
+        total_w = self.COLS * self.CARD_W + (self.COLS - 1) * self.GAP_X
+        x0 = (config.WIDTH - total_w) // 2
+        cards = []
+        for i in range(levels_catalog.count()):
+            row, col = divmod(i, self.COLS)
+            cards.append(pygame.Rect(
+                x0 + col * (self.CARD_W + self.GAP_X),
+                self.TOP + row * (self.CARD_H + self.GAP_Y),
+                self.CARD_W, self.CARD_H))
+        return cards
+
+    # ---------------------------------------------------------------- 输入
+    def handle_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_LEFT, pygame.K_a):
+                self._move_lr(-1)
+            elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                self._move_lr(1)
+            elif event.key in (pygame.K_UP, pygame.K_w):
+                self._move_ud(-self.COLS)
+            elif event.key in (pygame.K_DOWN, pygame.K_s):
+                self._move_ud(self.COLS)
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self._activate()
+            elif event.key == pygame.K_ESCAPE:
+                self.app.scenes.goto("menu")
+            elif event.key == pygame.K_DELETE:
+                self._press_clear()
+            elif event.key == pygame.K_F2:
+                # 调试：一键全解锁。写进存档，免得每次重启都要再按一遍。
+                # 界面上没有按钮——这是给自己和答辩现场准备的，不是给玩家的。
+                self.app.save.set_all_unlocked(True)
+                self.notice = u"已解锁全部关卡（F2）"
+                self.notice_timer = 2.0
+                self._rebuild_cards()
+        elif event.type == pygame.MOUSEMOTION:
+            self._hover(event.pos)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._hover(event.pos):
+                self._activate()
+
+    def _press_clear(self):
+        """清空进度的二次确认：第一次只提示，第二次才真清。"""
+        if not self._confirm_clear:
+            self._confirm_clear = True
+            self.notice = u"再按一次 Delete 清空全部进度"
+            self.notice_timer = 3.0
+            return
+        self.app.save.clear()
+        self._confirm_clear = False
+        self.notice = u"进度已清空"
+        self.notice_timer = 2.0
+        self.index = 0
+        self._rebuild_cards()
+
+    def _move_lr(self, delta):
+        col = self.index % self.COLS
+        if 0 <= col + delta < self.COLS:
+            self.index += delta
+
+    def _move_ud(self, delta):
+        n = len(self._cards)
+        target = self.index + delta
+        # 下一行可能不满（关数是 3 的倍数时不会），落到空位就原地不动
+        if 0 <= target < n:
+            self.index = target
+
+    def _hover(self, pos):
+        for i, rect in enumerate(self._cards):
+            if rect.collidepoint(pos):
+                self.index = i
+                return True
+        return False
+
+    def _activate(self):
+        lv = levels_catalog.at(self.index)
+        if lv is None:
+            return False
+        if not self.app.save.unlocked(lv["key"]):
+            prev = levels_catalog.at(self.index - 1)
+            self.notice = (u"先通关「%s」" % prev["name"]) if prev else u"尚未解锁"
+            self.notice_timer = 1.8
+            return False
+        return enter_level(self.app, lv["key"])
+
+    def update(self, dt):
+        if self.notice_timer > 0.0:
+            self.notice_timer = max(0.0, self.notice_timer - dt)
+            if self.notice_timer <= 0.0:
+                # 提示消失 = 确认窗口关闭。不能让它一直挂着，
+                # 否则三分钟后再按一次 Delete 就把进度清了。
+                self._confirm_clear = False
+
+    # ---------------------------------------------------------------- 绘制
+    def draw(self, surface):
+        surface.blit(self._bg, (0, 0))
+        for i, rect in enumerate(self._cards):
+            pair = self._card_imgs[i] if i < len(self._card_imgs) else None
+            if pair is None:
+                continue
+            surface.blit(pair[1 if i == self.index else 0],
+                         (rect.x - 4, rect.y - 4))
+
+        f_hint, _ = get_font(16)
+        if self.notice_timer > 0.0 and self.notice:
+            hint = self.notice
+            danger = (u"先通关" in hint or u"Delete" in hint
+                      or u"清空" in hint)
+            color = config.COLOR_DANGER if danger else config.COLOR_MUTED
+        else:
+            hint = u"← → ↑ ↓ 选择    Enter 开始    Esc 返回"
+            color = config.COLOR_MUTED
+        hw = f_hint.size(hint)[0]
+        surface.blit(f_hint.render(hint, True, color),
+                     ((config.WIDTH - hw) // 2, config.HEIGHT - 40))
+
+    def _draw_card(self, surface, rect, lv, selected):
+        sv = self.app.save
+        key = lv["key"]
+        unlocked = sv.unlocked(key)
+        cleared = sv.is_cleared(key)
+        perfect = sv.perfect(key)
+
+        if not unlocked:
+            fill, border = (243, 240, 233), (200, 195, 184)
+        elif selected:
+            fill, border = (255, 253, 238), config.COLOR_INK
+        else:
+            fill, border = (255, 255, 255), (156, 150, 139)
+        compat.panel(surface, rect, radius=14, fill=fill, border=border,
+                     width=3 if selected else 2)
+
+        f_idx, _ = get_font(15)
+        f_name, _ = get_font(26, bold=True)
+        f_desc, _ = get_font(14)
+        f_stat, _ = get_font(15)
+
+        # 角标：序号
+        idx_text = u"%02d" % (levels_catalog.index_of(key) + 1)
+        surface.blit(f_idx.render(idx_text, True, config.COLOR_MUTED),
+                     (rect.left + 14, rect.top + 10))
+
+        # 角标：右上角的状态（锁 / 对勾）
+        sx = rect.right - 26
+        sy = rect.top + 22
+        if not unlocked:
+            draw_lock(surface, sx, sy, (176, 170, 158))
+        elif cleared:
+            draw_check_mark(surface, sx, sy + 2, 9)
+
+        # 关名
+        name_color = config.COLOR_INK if unlocked else (176, 170, 158)
+        img = f_name.render(lv["name"], True, name_color)
+        surface.blit(img, (rect.centerx - img.get_width() // 2,
+                           rect.top + 30))
+
+        # 一句话说明 / 解锁条件
+        if unlocked:
+            desc = lv["blurb"]
+        else:
+            prev = levels_catalog.at(levels_catalog.index_of(key) - 1)
+            desc = (u"通关「%s」后解锁" % prev["name"]) if prev else u"尚未解锁"
+        img = f_desc.render(desc, True, config.COLOR_MUTED)
+        surface.blit(img, (rect.centerx - img.get_width() // 2,
+                           rect.top + 78))
+
+        # 成绩行
+        if not unlocked:
+            stat, color = u"——", (176, 170, 158)
+        elif not cleared:
+            stat, color = u"未通关", config.COLOR_MUTED
+        else:
+            parts = []
+            t = sv.best_time(key)
+            if t is not None:
+                parts.append(u"%.1fs" % t)
+            c = sv.best_coins(key)
+            tot = sv.entry(key).get("total", -1)
+            if c is not None and c >= 0:
+                parts.append(u"金币 %d/%d" % (c, tot) if tot > 0 else u"金币 %d" % c)
+            stat = (u"★  " if perfect else u"") + u"  ·  ".join(parts)
+            color = config.COLOR_CAMP if perfect else config.COLOR_INK
+        img = f_stat.render(stat, True, color)
+        surface.blit(img, (rect.centerx - img.get_width() // 2,
+                           rect.top + 104))
 
 
 # ---------------------------------------------------------------- 游戏场景
@@ -353,6 +695,18 @@ class GameScene(Scene):
         self._dlg_font = None
         self._dlg_body = None
 
+        # ---- 暂停与结算（M9）----
+        # 暂停做成场景内的一个遮罩，而不是切一个新场景：切场景会把
+        # world/player 全部丢掉，回来就得重新加载关卡（几十毫秒的烘焙），
+        # 而且检查点、金币、机关状态全没了。按一下 Esc 就重置一关，
+        # 这不是暂停，是同归于尽。
+        self.paused = False
+        self.pause_index = 0
+        # 到达终点后由 _record_result() 填写：破了哪些纪录、下一关是哪关
+        self.new_record = {}
+        self.next_key = ""
+        self.level_key = levels_catalog.path_to_key(self.level_path)
+
     # ---------------------------------------------------------------- 生命周期
     def on_enter(self):
         self.input = player.InputState()
@@ -379,6 +733,10 @@ class GameScene(Scene):
         self.toast_text = ""
         self.toast_timer = 0.0
         self.dialog = None
+        self.paused = False
+        self.pause_index = 0
+        self.new_record = {}
+        self.next_key = ""
 
     def load_level(self, path):
         """加载关卡。失败时把错误留在 self.load_error 里，画面显示出来。
@@ -392,6 +750,7 @@ class GameScene(Scene):
         self.goal_reached = False
         self.load_error = ""
         self.level_path = path
+        self.level_key = levels_catalog.path_to_key(path)
         # 换关 = 从头开始：死亡定格、检查点、统计都得清掉。少了这一句，
         # 上一关死在一半时切关，新关会带着旧关的死亡定格（开头冻半秒）
         # 和旧关的检查点开跑——_respawn 甚至会把角色传回上一关的坐标。
@@ -464,6 +823,10 @@ class GameScene(Scene):
     # ---------------------------------------------------------------- 输入
     def handle_event(self, event):
         if event.type == pygame.KEYDOWN:
+            # 三层优先级，从"最挡路的东西"往下排：
+            #   对话 > 结算 > 暂停 > 正常操作
+            # 顺序错了会出各种怪事，比如在暂停面板里按空格让角色跳了一下。
+
             # 对话打开时，除 E / Esc 之外的按键全部吞掉。不吞的话玩家会在
             # 读字时按空格把角色跳走，回来发现人已经在坑里了。
             if self.dialog is not None:
@@ -473,8 +836,18 @@ class GameScene(Scene):
                     self.dialog = None
                 return
 
+            # 到终点之后整局已冻结，只剩"下一关 / 重来 / 选关"三件事。
+            # 不能再按 Esc 弹暂停——那时暂停什么？跑完了。
+            if self.goal_reached:
+                self._handle_goal_key(event.key)
+                return
+
+            if self.paused:
+                self._handle_pause_key(event.key)
+                return
+
             if event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
-                self.app.scenes.goto("menu")
+                self._open_pause()
                 return
             if event.key == pygame.K_e:
                 self._try_interact()
@@ -491,12 +864,15 @@ class GameScene(Scene):
                 self.go_to_checkpoint()
             elif event.key == pygame.K_n:
                 self.next_level()
-            elif event.key == pygame.K_RETURN and self.goal_reached:
-                self.restart()
         elif event.type == pygame.KEYUP:
             if event.key == pygame.K_SPACE:
                 self.input.jump_released = True
                 self.input.jump_held = False
+        elif self.paused and event.type == pygame.MOUSEMOTION:
+            self._pause_hover(event.pos)
+        elif self.paused and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._pause_hover(event.pos):
+                self._activate_pause()
 
         # 失焦必须清空输入，否则回来时角色会一直往一个方向跑
         if compat.focus_lost(event):
@@ -508,24 +884,89 @@ class GameScene(Scene):
         elif compat.focus_gained(event):
             self._focused = True
 
-    def next_level(self):
-        """N 键切到下一个关卡文件。
+    # ---- 暂停 ----
+    PAUSE_ITEMS = [(u"继续游戏", "resume"), (u"重开本关", "restart"),
+                   (u"选择关卡", "select"), (u"返回主菜单", "menu")]
 
-        M6 才做正式的选关界面；这里先给一个循环切换，是因为 M4 的机关
-        （篝火/地刺/弹跳板/移动平台）全在 l2 里，没有它就只能改代码试玩。
+    def _open_pause(self):
+        self.paused = True
+        self.pause_index = 0
+        # 打开菜单的瞬间清掉按键边沿与水平速度：否则关掉暂停的那一帧，
+        # 角色会带着"按着右键"和"待处理的跳跃"冲出去。
+        self.input.release_edges()
+        self.input.jump_held = False
+        if self.player is not None:
+            self.player.vx = 0.0
+
+    def _handle_pause_key(self, key):
+        n = len(self.PAUSE_ITEMS)
+        if key in (pygame.K_UP, pygame.K_w):
+            self.pause_index = (self.pause_index - 1) % n
+        elif key in (pygame.K_DOWN, pygame.K_s):
+            self.pause_index = (self.pause_index + 1) % n
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+            self._activate_pause()
+        elif key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+            self.paused = False
+
+    def _pause_item_rects(self):
+        """暂停面板的按钮矩形。面板位置固定，矩形可以每次算——一共四项，
+        算出来的代价远小于"缓存一份再忘了同步"的代价。"""
+        rects = []
+        box = self._pause_box()
+        top = box.top + 96
+        for i in range(len(self.PAUSE_ITEMS)):
+            # 左边留 56 而不是 40：选中箭头画在 rect.left-34，留 40 的话
+            # 箭头正好戳在面板边框上，看着像画坏了
+            rects.append(pygame.Rect(box.left + 56, top + i * 56,
+                                     box.w - 96, 44))
+        return rects
+
+    def _pause_box(self):
+        box = pygame.Rect(0, 0, 340, 96 + len(self.PAUSE_ITEMS) * 56 + 18)
+        box.center = (config.WIDTH // 2, config.HEIGHT // 2)
+        return box
+
+    def _pause_hover(self, pos):
+        for i, rect in enumerate(self._pause_item_rects()):
+            if rect.collidepoint(pos):
+                self.pause_index = i
+                return True
+        return False
+
+    def _activate_pause(self):
+        _, action = self.PAUSE_ITEMS[self.pause_index]
+        self.paused = False
+        if action == "resume":
+            return
+        if action == "restart":
+            self.restart()
+        elif action == "select":
+            self.app.scenes.goto("select")
+        elif action == "menu":
+            self.app.scenes.goto("menu")
+
+    # ---- 结算 ----
+    def _handle_goal_key(self, key):
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+            if self.next_key:
+                enter_level(self.app, self.next_key)
+            else:
+                self.app.scenes.goto("select")
+        elif key == pygame.K_r:
+            self.restart()
+        elif key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+            self.app.scenes.goto("select")
+
+    def next_level(self):
+        """N 键切到下一关。
+
+        按 levels_catalog 的顺序走，而不是 os.listdir 排序：后者在
+        l10 出现之后会把"下一关"指到第 2 关去。到最后一关就回第一关
+        （N 是调试键，不是通关流程，不需要"没有下一关"的语义）。
         """
-        try:
-            names = sorted(n for n in os.listdir(config.LEVEL_DIR)
-                           if n.endswith(".txt"))
-        except OSError:
-            return False
-        if len(names) < 2:
-            return False
-        cur = os.path.basename(self.level_path)
-        i = names.index(cur) if cur in names else -1
-        self.level_path = os.path.join(config.LEVEL_DIR, names[(i + 1) % len(names)])
-        self._reset_stats()
-        self.load_level(self.level_path)
+        nxt = levels_catalog.next_of(self.level_key) or levels_catalog.first()
+        self.load_level(levels_catalog.path_of(nxt))
         return True
 
     def _poll_axis(self):
@@ -587,6 +1028,15 @@ class GameScene(Scene):
         # 全部冻结——"读字的时候被石头砸死"是最没道理的一种死法。
         if self.dialog is not None:
             self.dialog.update(dt)
+            self.input.release_edges()
+            self.input.jump_held = False
+            self.player.vx = 0.0
+            return
+
+        # 暂停：连世界都不推进。这一句必须放在 world.update 之前——
+        # 否则"暂停"期间荡锤还在摆、落刺还在掉、计时还在走，玩家回来
+        # 发现自己死在暂停菜单里。
+        if self.paused:
             self.input.release_edges()
             self.input.jump_held = False
             self.player.vx = 0.0
@@ -691,6 +1141,10 @@ class GameScene(Scene):
                 self.checkpoint_index = idx
                 print(u" 检查点   : 第 %d 个篝火点亮，重生点 (%.0f, %.0f)"
                       % (idx + 1, cp["spawn"][0], cp["spawn"][1]))
+                # 之前只有一行终端日志，画面上除了篝火变色没有任何反馈。
+                # 玩家跑到这里根本不知道自己刚刚"存档"了——而这是这关
+                # 最需要知道的一件事。
+                self.toast(u"篝火点燃：这里成了重生点", 1.8)
 
         self.world.collect(rect)
 
@@ -707,6 +1161,29 @@ class GameScene(Scene):
                 self.level_time, self.world.taken_coins,
                 self.world.total_coins, self.deaths))
             self._print_death_summary()
+            self._record_result()
+
+    def _record_result(self):
+        """把这一局写进存档，并算好"下一关是哪一关"。
+
+        只在**到达终点**时调用。中途退出、被打死几十次之后关窗口，都不算
+        通关——跑酷的通关定义就是跑到终点，不是"来过"。
+        """
+        self.new_record = {}
+        self.next_key = ""
+        if not self.level_key:
+            return {}
+        rec = self.app.save.record(
+            self.level_key, self.level_time,
+            self.world.taken_coins, self.world.total_coins, self.deaths)
+        self.new_record = rec
+        nxt = levels_catalog.next_of(self.level_key)
+        if nxt is not None:
+            self.next_key = nxt["key"]
+        if rec.get("first"):
+            print(u" 存档     : %s 首次通关，下一关 %s"
+                  % (self.level_key, self.next_key or u"（已到最后一关）"))
+        return rec
 
     def _print_death_summary(self):
         """通关时把死因归一下类，一行打完。
@@ -796,7 +1273,8 @@ class GameScene(Scene):
         self._draw_player(surface)
         self._draw_hud(surface)
 
-        if self.show_debug and self.death_timer <= 0.0:
+        if (self.show_debug and self.death_timer <= 0.0
+                and not self.paused and not self.goal_reached):
             self._draw_debug(surface)
 
         # 提示条放在调试面板之后：它只在捡到道具那 2 秒出现，
@@ -804,12 +1282,12 @@ class GameScene(Scene):
         if self.toast_timer > 0.0 and self.toast_text:
             self._draw_toast(surface)
 
-        # 按键提示条只在没有对话时画：对话面板就压在它上面，
-        # 半截被盖住的灰字看着像渲染坏了。
-        if self.dialog is None:
+        # 按键提示条只在没有对话、没有暂停、没到终点时画：那些面板就压在
+        # 它上面，半截被盖住的灰字看着像渲染坏了。
+        if self.dialog is None and not self.paused and not self.goal_reached:
             f_hint, _ = get_font(16)
             hint = (u"← → / A D 移动   空格 跳跃（空中按住 滑翔）   Shift 冲刺   "
-                    u"E 看牌子 / 对话   T 回检查点   R 重开   N 切关   F1 调试   Esc 菜单")
+                    u"E 看牌子 / 对话   T 回检查点   R 重开   N 切关   F1 调试   Esc 暂停")
             w = f_hint.size(hint)[0]
             surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
                          ((config.WIDTH - w) // 2, config.HEIGHT - 26))
@@ -818,6 +1296,8 @@ class GameScene(Scene):
             self._draw_death_panel(surface)
         elif self.goal_reached:
             self._draw_goal_panel(surface)
+        elif self.paused:
+            self._draw_pause_panel(surface)
 
         # 对话框永远在最上层：它出现时整局已暂停，被 HUD 压住就等于没打开
         if self.dialog is not None:
@@ -826,6 +1306,43 @@ class GameScene(Scene):
                 self._dlg_body, _ = get_font(21)
             self.dialog.draw(surface, self._dlg_font, self._dlg_body,
                              self._dialog_tail())
+
+    def _draw_pause_panel(self, surface):
+        """暂停面板。半透明遮罩压暗世界，让"现在不动了"一眼可见。"""
+        veil = pygame.Surface((config.WIDTH, config.HEIGHT), pygame.SRCALPHA)
+        veil.fill((250, 247, 238, 205))
+        surface.blit(veil, (0, 0))
+
+        box = self._pause_box()
+        compat.panel(surface, box, radius=20, fill=(255, 255, 255),
+                     border=config.COLOR_INK, width=3)
+
+        f_title, _ = get_font(30, bold=True)
+        title = f_title.render(u"暂停", True, config.COLOR_INK)
+        surface.blit(title, (box.centerx - title.get_width() // 2,
+                             box.top + 22))
+
+        # 关卡与进度：暂停时最常问的两件事就是"我在哪一关"和"打了多久"
+        f_sub, _ = get_font(16)
+        name = u""
+        lv = levels_catalog.get(self.level_key)
+        if lv is not None:
+            name = lv["name"]
+        sub = u"%s    %.1f 秒    金币 %d/%d" % (
+            name or u"第 ? 关", self.level_time,
+            self.world.taken_coins if self.world else 0,
+            self.world.total_coins if self.world else 0)
+        img = f_sub.render(sub, True, config.COLOR_MUTED)
+        surface.blit(img, (box.centerx - img.get_width() // 2, box.top + 62))
+
+        draw_menu_list(surface, self._pause_item_rects(),
+                       [label for label, _ in self.PAUSE_ITEMS],
+                       self.pause_index, f_sub)
+
+        f_hint, _ = get_font(14)
+        hint = f_hint.render(u"Esc 继续", True, config.COLOR_MUTED)
+        surface.blit(hint, (box.centerx - hint.get_width() // 2,
+                            box.bottom - 24))
 
     def _draw_player(self, surface):
         """画角色：优先贴图动画，素材缺失时退回代码火柴人。
@@ -1039,29 +1556,80 @@ class GameScene(Scene):
                                      int(bar.width * (1.0 - ratio)), bar.height))
 
     def _draw_goal_panel(self, surface):
-        box = pygame.Rect(0, 0, 420, 190)
+        """结算面板。
+
+        三件事按重要性从上到下排：我跑完了 → 这一局怎么样 → 接下来去哪。
+        以前这里只有"Enter 重来"，等于每次通关都要手动退回菜单再选关，
+        连续挑战的节奏全断了。
+        """
+        box = pygame.Rect(0, 0, 480, 240)
         box.center = (config.WIDTH // 2, config.HEIGHT // 2 - 10)
         veil = pygame.Surface((config.WIDTH, config.HEIGHT), pygame.SRCALPHA)
-        veil.fill((250, 247, 238, 190))
+        veil.fill((250, 247, 238, 195))
         surface.blit(veil, (0, 0))
         compat.panel(surface, box, radius=18, fill=(255, 255, 255),
                      border=config.COLOR_INK, width=3)
 
         f_big, _ = get_font(34, bold=True)
         f, _ = get_font(18)
-        lines = [
-            (u"到达终点", f_big, config.COLOR_INK),
-            (u"用时 %.1f 秒    金币 %d / %d    死亡 %d 次"
-             % (self.level_time, self.world.taken_coins,
-                self.world.total_coins, self.deaths),
-             f, config.COLOR_MUTED),
-            (u"Enter 重来    Esc 返回菜单", f, config.COLOR_MUTED),
-        ]
-        y = box.top + 26
-        for text, font_obj, color in lines:
-            img = font_obj.render(text, True, color)
+        f_small, _ = get_font(15)
+
+        sv = self.app.save
+        nxt = levels_catalog.get(self.next_key) if self.next_key else None
+        all_done = sv.all_cleared()
+
+        y = box.top + 22
+        title = u"全部通关！" if all_done else u"到达终点"
+        img = f_big.render(title, True, config.COLOR_INK)
+        surface.blit(img, (box.centerx - img.get_width() // 2, y))
+        y += img.get_height() + 12
+
+        line = (u"用时 %.1f 秒     金币 %d / %d     死亡 %d 次"
+                % (self.level_time, self.world.taken_coins,
+                   self.world.total_coins, self.deaths))
+        img = f.render(line, True, config.COLOR_MUTED)
+        surface.blit(img, (box.centerx - img.get_width() // 2, y))
+        y += img.get_height() + 12
+
+        # 新纪录 / 最佳成绩：同一行，因为玩家只关心"这次比上次好还是差"
+        rec = self.new_record or {}
+        badges = []
+        if rec.get("time"):
+            badges.append(u"最快")
+        if rec.get("coins"):
+            badges.append(u"金币")
+        if rec.get("deaths"):
+            badges.append(u"最少死亡")
+        if rec.get("first"):
+            note = u"首次通关"
+            color = config.COLOR_CAMP
+        elif badges:
+            note = u"新纪录：" + u" · ".join(badges)
+            color = config.COLOR_CAMP
+        else:
+            best = sv.best_time(self.level_key)
+            note = (u"本关最佳 %.1f 秒" % best) if best is not None else u""
+            color = config.COLOR_MUTED
+        if note:
+            img = f_small.render(note, True, color)
             surface.blit(img, (box.centerx - img.get_width() // 2, y))
-            y += img.get_height() + 16
+        y += 34
+
+        # 分隔线：上面是成绩，下面是去向。画一条线比留白更清楚地分两段
+        pygame.draw.line(surface, (222, 217, 206),
+                         (box.left + 36, y - 12), (box.right - 36, y - 12), 2)
+
+        if nxt is not None:
+            first = u"Enter  下一关「%s」" % nxt["name"]
+            second = u"R  重来本关          Esc  选择关卡"
+        else:
+            first = u"Enter  返回选关"
+            second = u"R  重来本关          Esc  选择关卡"
+        img = f.render(first, True, config.COLOR_INK)
+        surface.blit(img, (box.centerx - img.get_width() // 2, y))
+        y += img.get_height() + 14
+        img = f_small.render(second, True, config.COLOR_MUTED)
+        surface.blit(img, (box.centerx - img.get_width() // 2, y))
 
     def _draw_load_error(self, surface):
         box = pygame.Rect(0, 0, 700, 260)

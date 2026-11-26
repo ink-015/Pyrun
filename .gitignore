@@ -6,6 +6,7 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+save.json
 save.corrupt.json
 
 # 体检脚本与调试过程产生的临时文件

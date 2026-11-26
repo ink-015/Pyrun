@@ -33,6 +33,7 @@ import pygame  # noqa: E402
 import compat  # noqa: E402
 import config  # noqa: E402
 import io_utils  # noqa: E402
+import levels_catalog  # noqa: E402
 
 RESULTS = []
 
@@ -273,6 +274,21 @@ def c_images():
     return "%d 张全部可加载" % len(pngs)
 
 
+def c_levels():
+    """关卡目录与磁盘文件必须一一对应。
+
+    "一共有几关"以前散在 listdir 和三个地方，加一关忘改一处就会出现
+    选关界面少一张卡片、或者归档到一个不存在的文件。
+    """
+    missing = levels_catalog.missing_files()
+    assert not missing, u"目录登记了但磁盘上没有：%s" % ", ".join(missing)
+    on_disk = sorted(n for n in os.listdir(config.LEVEL_DIR) if n.endswith(".txt"))
+    extra = [n for n in on_disk
+             if not levels_catalog.path_to_key(os.path.join(config.LEVEL_DIR, n))]
+    assert not extra, u"磁盘上有但目录没登记：%s" % ", ".join(extra)
+    return u"%d 关，文件齐全" % levels_catalog.count()
+
+
 def c_font():
     font, name = None, None
     for folder in config.FONT_DIRS:
@@ -414,6 +430,7 @@ def main():
     check(u"音效可加载", c_audio_files, level="SKIP")
     check(u"图片可加载", c_images)
     check(u"中文字体", c_font)
+    check(u"关卡目录", c_levels)
     check(u"禁用 API 扫描", c_static_scan)
     check(u"3.8+ 语法扫描", c_walrus)
     check(u"渲染性能", c_perf)
