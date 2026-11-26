@@ -13,3 +13,6 @@ save.corrupt.json
 .envcheck*
 .tmp_*
 .probe*
+
+# 本地工作区记忆（WorkBuddy），不进仓库
+.workbuddy/

@@ -17,11 +17,16 @@
     {
       "version": 1,
       "all_unlocked": false,
+      "settings": {"sfx": 7, "show_debug": false, "shake": true},
       "levels": {
         "l1": {"cleared": true, "time": 37.0, "coins": 10,
                "total": 12, "deaths": 0}
       }
     }
+
+设置与进度放在同一个文件里：它们都是"这台机器上这个人的偏好"。
+分成两个文件的话，清档时很容易只清了进度、留下"音量 0"，
+下次进游戏以为音效坏了。
 """
 
 import levels_catalog
@@ -29,6 +34,18 @@ import config
 import io_utils
 
 VERSION = 1
+
+# 设置的默认值与合法范围。新增设置项必须在这里登记，否则 load 时会被
+# 丢掉（玩家改过的值下次启动就没了，而这类 bug 极难复现）。
+SETTINGS_SPEC = {
+    "sfx": (7, 0, 10),        # 音效音量 0~10 档
+    "show_debug": (False,),   # 进关是否默认显示调试面板
+    "shake": (True,),         # 画面震动
+}
+
+
+def _default_settings():
+    return dict((k, v[0]) for k, v in SETTINGS_SPEC.items())
 
 
 def _blank_entry():
@@ -47,6 +64,7 @@ class Save(object):
         self.readonly = readonly
         self.levels = {}
         self.all_unlocked = False
+        self.settings = _default_settings()
         # 读取时丢弃了什么，用于启动日志。玩家看不到，但我需要知道
         # "为什么进度没了"是文件坏了还是读到旧版本。
         self.warnings = []
@@ -57,6 +75,7 @@ class Save(object):
     def load(self):
         self.levels = {}
         self.all_unlocked = False
+        self.settings = _default_settings()
         self.warnings = []
         data = io_utils.read_json(self.path, default=None)
         if data is None:
@@ -72,6 +91,7 @@ class Save(object):
             self.warnings.append(u"存档版本 %r，当前 %r" % (ver, VERSION))
 
         self.all_unlocked = bool(data.get("all_unlocked", False))
+        self._load_settings(data.get("settings"))
         raw = data.get("levels")
         if not isinstance(raw, dict):
             if raw is not None:
@@ -85,6 +105,28 @@ class Save(object):
                 continue
             self.levels[key] = self._clean(item)
         return True
+
+    def _load_settings(self, raw):
+        """逐项校验设置。**不能整块丢弃**：存档里多一个不认识的键
+        （旧版本、手改过）不该把音效音量也一起还原成默认。"""
+        if raw is None:
+            return
+        if not isinstance(raw, dict):
+            self.warnings.append(u"settings 不是对象，已用默认值")
+            return
+        for key, spec in SETTINGS_SPEC.items():
+            if key not in raw:
+                continue
+            val = raw[key]
+            if len(spec) == 3:                 # 数值项：默认, 下限, 上限
+                lo, hi = spec[1], spec[2]
+                # bool 是 int 的子类，True 会把音量变成 1 档——先排掉
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    self.warnings.append(u"设置 %s 不是数字，已用默认值" % key)
+                    continue
+                self.settings[key] = max(lo, min(hi, int(round(val))))
+            else:                              # 开关项
+                self.settings[key] = bool(val)
 
     def _clean(self, item):
         """逐字段校验：一个坏字段不能带走整条记录。"""
@@ -112,6 +154,7 @@ class Save(object):
             return False
         data = {"version": VERSION,
                 "all_unlocked": self.all_unlocked,
+                "settings": self.settings,
                 "levels": self.levels}
         try:
             io_utils.write_json(self.path, data)
@@ -222,6 +265,34 @@ class Save(object):
         self.all_unlocked = bool(flag)
         self.dirty = True
         self.write()
+
+    # ---------------------------------------------------------------- 设置
+    def get_setting(self, key):
+        if key in self.settings:
+            return self.settings[key]
+        spec = SETTINGS_SPEC.get(key)
+        return spec[0] if spec else None
+
+    def set_setting(self, key, value):
+        """改一项设置并立刻落盘。
+
+        设置的写入频率是"按一下方向键一次"，不是每帧一次，直接写盘最简单；
+        攒着不写会出现"调完音量直接关窗口，下次还是老的"。
+        """
+        spec = SETTINGS_SPEC.get(key)
+        if spec is None:
+            return False
+        if len(spec) == 3:
+            lo, hi = spec[1], spec[2]
+            val = max(lo, min(hi, int(value)))
+        else:
+            val = bool(value)
+        if self.get_setting(key) == val:
+            return False
+        self.settings[key] = val
+        self.dirty = True
+        self.write()
+        return True
 
     def clear(self):
         """清空进度。只在调试入口里调用，界面上不给按钮——误触代价太大。"""

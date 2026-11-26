@@ -100,6 +100,15 @@ class Player(object):
         self.anim_frame = 0
         self.anim_phase = 0.0       # 跑步用位移累加，避免速度变化时打滑
         self.anim_time = 0.0
+
+        # ---- 一次性事件（M10）----
+        # 每帧在 update 开头清空，本帧发生的"跳跃/落地/冲刺/弹跳/踩怪/开伞"
+        # 往里塞一个字符串。场景层在物理之后读一次，用来放音效和粒子。
+        #
+        # 为什么不让 Player 直接播音效：物理层要能在自检里跑几千帧，
+        # 一旦它持有 mixer，任何无音频环境（CI、dummy）都会变成失败。
+        # 这里只产生"事实"，怎么表现是上层的事。
+        self.events = []
         
 
     # ---------------------------------------------------------------- 几何
@@ -122,6 +131,8 @@ class Player(object):
         # 不能用 self.on_ground 现查：_move_vertical 内部已经把
         # on_ground 置 True 了，事后再判 if not on_ground 永远为假。
         was_grounded = self.on_ground
+        # 事件只描述本帧，不累积。场景每帧物理之后立刻取走。
+        self.events = []
 
         self.bounce_cd = max(0.0, self.bounce_cd - dt)
 
@@ -153,11 +164,17 @@ class Player(object):
         #     这一帧起生效；放到重力之后再判，第一帧仍按跑速和正常重力算，
         #     表现为"按住空格后伞晚一帧才张开"。
         #     条件里带 vy > 0，所以"重新上升就退出滑翔"是自带的，不用另写。
+        prev_glide = getattr(self, "_was_gliding", False)
         self.gliding = (self.has_glider and not dashing
                         and not self.on_ground and self.vy > 0.0
                         and inp.jump_held)
         if self.gliding:
             self.glide_frames += 1
+            # 只在"刚张开"那一帧报事件：之后每帧都报的话，一次滑翔
+            # 会把同一个音效叠上百次，粒子也会糊成一整条尾巴。
+            if not prev_glide:
+                self.events.append("glide")
+        self._was_gliding = self.gliding
 
         # 5. 水平速度：冲刺期间接管，否则正常加速 / 减速
         if dashing:
@@ -201,6 +218,7 @@ class Player(object):
             self.jump_buffer = 0.0
             self.jumping = True    # 标记"处于可被切短的上升段"
             self.jump_count += 1
+            self.events.append("jump")
 
         # 8. 松开切跳：只在上升段、且只切一次
         if inp.jump_released:
@@ -230,6 +248,9 @@ class Player(object):
                 self.vy = min(self.vy, config.GLIDE_FALL_SPEED)
 
         # 10. 垂直移动与碰撞
+        #     记下碰撞前的下落速度：落地音要按"摔得多重"分级，而
+        #     _move_vertical 结束时 vy 已经被清 0 了。
+        fall_vy = self.vy
         self._move_vertical(self.vy * dt, solids, oneways, bouncers)
 
         # 11. 脚下贴合。
@@ -243,6 +264,10 @@ class Player(object):
                 self.vy = 0.0
                 if not was_grounded:
                     self.land_timer = config.LAND_SQUASH_TIME
+                    # 从很低的地方落下（走过一格小台阶）不报落地音：
+                    # 一路下楼梯会变成"哒哒哒哒"，比没有音效还吵。
+                    if fall_vy > 180.0:
+                        self.events.append("land")
                 self.on_ground = True
                 self.jumping = False
             else:
@@ -275,6 +300,7 @@ class Player(object):
         self.dash_count += 1
         self.vy = 0.0
         self.jumping = False
+        self.events.append("dash")
 
     @property
     def dashing(self):
@@ -304,6 +330,7 @@ class Player(object):
         self.jump_buffer = 0.0
         self.bounce_cd = config.BOUNCE_COOLDOWN
         self.bounce_count += 1
+        self.events.append("bounce")
         return True
 
     def stomp_bounce(self, speed=None):
@@ -321,6 +348,7 @@ class Player(object):
         self.jump_buffer = 0.0
         self.gliding = False
         self.stomp_count += 1
+        self.events.append("stomp")
         return True
 
     def stands_on(self, rect, tol=2.0):

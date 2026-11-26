@@ -13,6 +13,7 @@
 
 import math
 import os
+import random
 
 import pygame
 
@@ -555,7 +556,21 @@ class Camera(object):
         self.world = pygame.Rect(world_rect)
         self.x = 0.0
         self.y = 0.0
+        # 震屏（M10）：只改绘制偏移，不改相机位置。改位置的话，上一次
+        # 死亡留下的抖动会把"相机停在哪"也带偏，重生后镜头要重新收敛。
+        self._sx = 0
+        self._sy = 0
+        self.shake_left = 0.0
+        self.shake_dur = 0.0
+        self.shake_power = 0.0
         self.clamp()
+
+    def kick(self, power=6.0, duration=0.20):
+        """震一下。多次调用不叠加，取最强的那次。"""
+        if power >= self.shake_power or self.shake_left <= 0.0:
+            self.shake_power = float(power)
+            self.shake_dur = max(0.01, float(duration))
+            self.shake_left = self.shake_dur
 
     # ---- 边界 ----
     @staticmethod
@@ -600,11 +615,28 @@ class Camera(object):
 
         self.clamp()
 
+        # 震屏衰减：按剩余时间线性收小，最后一帧正好归零，
+        # 不会出现"抖到一半突然定住"。
+        if self.shake_left > 0.0:
+            self.shake_left = max(0.0, self.shake_left - dt)
+            amp = self.shake_power * (self.shake_left / self.shake_dur)
+            self._sx = int(round(random.uniform(-amp, amp)))
+            self._sy = int(round(random.uniform(-amp, amp)))
+        else:
+            self._sx = 0
+            self._sy = 0
+
     # ---- 换算 ----
     @property
     def offset(self):
-        """世界坐标 -> 屏幕坐标的整数偏移。整数化避免像素抖动。"""
-        return (-int(round(self.x)), -int(round(self.y)))
+        """世界坐标 -> 屏幕坐标的整数偏移。整数化避免像素抖动。
+
+        震屏的偏移在这里叠加：random 只能在 update 里取一次，放进 property
+        会变成"每调用一次就换一个偏移"——同一帧里背景和角色各拿到不同的
+        抖动值，画面会裂开。
+        """
+        return (-int(round(self.x)) + self._sx,
+                -int(round(self.y)) + self._sy)
 
     def apply(self, rect):
         ox, oy = self.offset

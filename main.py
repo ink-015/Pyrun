@@ -21,6 +21,9 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-m7      第 5 关：踩怪 / 刺轮 / 荡锤 / 空中伞四张图
     python main.py --smoke-m8      第 6 关：伪装砖 / 落刺 / 突墙 / 二连石四张图
     python main.py --smoke-m9      界面四张图：主菜单 / 选关 / 暂停 / 结算
+    python main.py --smoke-m10     界面三张图：主菜单（四项）/ 设置 / 音量调到 0
+    python main.py --smoke-fx      M10 粒子两张图：落地扬尘 / 死亡碎块
+    python main.py --no-audio      不开音效（排查"没声音"是设备问题还是接入问题）
     python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -39,6 +42,7 @@ import time
 import pygame
 
 import assets
+import audio as audio_mod
 import compat
 import config
 import levels_catalog
@@ -59,6 +63,15 @@ class App(object):
         # 不能让每个场景自己 new 一个——那样两个存档对象各自持有不同的
         # 内存副本，谁后写谁覆盖，进度会莫名其妙丢。
         self.save = None
+        # 音效播放器。任何场景都可以 app.audio.play("coin")，没有音频设备
+        # 时它只是返回 False，不需要调用方 try/except。
+        # 默认给一个"禁用"的实例：自检与截图脚本会自己 new App()，它们
+        # 不该因为少了一行初始化就在 die() 里抛 AttributeError。
+        self.audio = audio_mod.Audio(enabled=False)
+        # 连续挑战的累计成绩（从主菜单"开始游戏"起，到回菜单/关窗口止）。
+        # 放在 App 上而不是 GameScene 上：换关时 GameScene 会重建，累计值
+        # 必须活过场景切换。
+        self.run_state = None
         self.running = True
 
     def quit(self):
@@ -319,9 +332,17 @@ def main():
         for w in app.save.warnings:
             print(u" 存档     : %s" % w)
     print(u" 存档     : %s（%s）" % (app.save.path, app.save.summary()))
+    # 音量存在存档里（0~10 档），这里换算成 0..1 交给播放器。
+    # --no-audio 给排查用：确认"没声音"是设备问题还是接入问题。
+    # 自检与截图脚本一律不出声：它们会把同一个音效播几十次。
+    app.audio = audio_mod.Audio(
+        enabled=(not readonly) and "--no-audio" not in sys.argv,
+        volume=app.save.get_setting("sfx") / 10.0)
+    print(u" 音效     :", app.audio.status)
     app.scenes = scenes.SceneManager(app)
     app.scenes.register("menu", scenes.MenuScene)
     app.scenes.register("select", scenes.LevelSelectScene)
+    app.scenes.register("settings", scenes.SettingsScene)
     app.scenes.register("game", scenes.GameScene)
     app.scenes.start("menu")
 
@@ -801,6 +822,81 @@ def main():
         print(u" 结算     : goal=%s next=%s rec=%s"
               % (scene.goal_reached, scene.next_key, scene.new_record))
         print(" 截图   :", save_screenshot(screen, "m9_goal.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-m10" in sys.argv:
+        # M10 三张图：主菜单（四项）/ 设置页 / 设置页调低音量后的样子。
+        # 音量 0 档那张是特意留的：要能看出"十格全空 + 音频状态写着已关闭"，
+        # 而不是一片空白让人分不清是画错了还是调到底了。
+        app.scenes.start("menu")
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 菜单     : %s" % [l for l, _ in app.scenes.current.items])
+        print(" 截图   :", save_screenshot(screen, "m10_menu.png"))
+
+        app.scenes.start("settings")
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        sc = app.scenes.current
+        print(u" 设置     : %s" % [(k, app.save.get_setting(k))
+                                   for k, _ in sc.ITEMS])
+        print(" 截图   :", save_screenshot(screen, "m10_settings.png"))
+
+        app.save.set_setting("sfx", 0)
+        app.audio.set_volume(0.0)
+        sc.draw(screen)
+        pygame.display.flip()
+        print(" 截图   :", save_screenshot(screen, "m10_settings_mute.png"))
+        pygame.quit()
+        return 0
+
+    if "--smoke-fx" in sys.argv:
+        # M10 粒子两张图：落地扬尘 / 死亡碎块 + 震屏。
+        # 抓"事件发生后的第 3 帧"而不是当帧：当帧粒子还在出生点，
+        # 看起来像几个贴在地上的点，看不出是"炸开的"。
+        app.level_path = levels_catalog.path_of("l2")
+        app.scenes.start("game")
+        sc = app.scenes.current
+        for _ in range(30):
+            app.scenes.update(config.FIXED_DT)
+        sc.override_axis = 1.0
+        for _ in range(20):
+            app.scenes.update(config.FIXED_DT)
+        sc.input.jump_pressed = True
+        sc.input.jump_held = True
+        for _ in range(8):
+            app.scenes.update(config.FIXED_DT)
+        sc.input.jump_held = False
+        sc.input.jump_released = True
+        # 落地前松方向键：站着扬尘才看得清，一边跑一边扬会被角色自己挡住
+        sc.override_axis = 0.0
+        landed = False
+        for _ in range(90):
+            app.scenes.update(config.FIXED_DT)
+            if "land" in sc.player.events:
+                landed = True
+                break
+        for _ in range(3):
+            app.scenes.update(config.FIXED_DT)
+        sc.invuln = 0.0
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 落地     : landed=%s 粒子 %d 个 cam=%s" % (
+            landed, sc.fx.count, sc.camera.offset))
+        print(" 截图   :", save_screenshot(screen, "m10_land.png"))
+
+        sc.die(u"测试用死亡")
+        # 抓第 8 帧（约 0.13 秒）：第 4 帧时碎块还贴着身体轮廓，看着像
+        # "描了粗边"，不像炸开。
+        for _ in range(8):
+            app.scenes.update(config.FIXED_DT)
+        sc.invuln = 0.0
+        app.scenes.draw(screen)
+        pygame.display.flip()
+        print(u" 死亡     : 粒子 %d 个，震屏剩余 %.2fs"
+              % (sc.fx.count, sc.camera.shake_left))
+        print(" 截图   :", save_screenshot(screen, "m10_death.png"))
         pygame.quit()
         return 0
 

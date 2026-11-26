@@ -15,9 +15,11 @@ import tempfile
 import pygame
 
 import assets
+import audio as audio_mod
 import config
 import dialog
 import enemy
+import fx as fx_mod
 import io_utils
 import levels_catalog
 import player
@@ -2891,7 +2893,11 @@ def test_m9_menu(app):
     menu.on_enter()
     _check(u"新玩家显示「开始游戏」",
            menu.items[0][0] == u"开始游戏", menu.items[0][0])
-    _check(u"菜单三项", len(menu.items) == 3, u"%s" % (menu.items,))
+    _check(u"菜单四项（含设置）",
+           len(menu.items) == 4
+           and menu.items[2][1] == "settings"
+           and menu.items[3][1] == "quit",
+           u"%s" % (menu.items,))
 
     app.save.record("l1", 30.0, 10, 12, 0)
     app.save.record("l2", 30.0, 10, 12, 0)
@@ -3050,6 +3056,243 @@ def test_m9_goal(app):
     app.scenes._pending = None
 
 
+# ---------------------------------------------------------------- M10 音效与设置
+
+def test_m10_audio():
+    _section(u"M10 音效：合成与降级")
+
+    names = audio_mod.synth_names()
+    _check(u"音效表齐全（9 种以上）", len(names) >= 9, u"%d 种：%s"
+           % (len(names), u"、".join(names)))
+
+    bad = []
+    for name in names:
+        s = audio_mod.synth_peek(name)
+        if not s:
+            bad.append(name + ":空")
+            continue
+        dur = len(s) / float(audio_mod.SAMPLE_RATE)
+        peak = max(abs(v) for v in s)
+        head = max(abs(v) for v in s[:30])
+        tail = max(abs(v) for v in s[-30:])
+        # 时长 0.02~0.6 秒、有声音但没削波、首尾都收到接近 0（防爆音）
+        if not (0.02 <= dur <= 0.60):
+            bad.append(u"%s:%.2fs" % (name, dur))
+        elif peak < 800 or peak > 32000:
+            bad.append(u"%s:peak=%d" % (name, peak))
+        elif tail > peak * 0.35:
+            bad.append(u"%s:尾 %.0f/%.0f" % (name, tail, peak))
+        elif head > peak * 0.85:
+            bad.append(u"%s:起音太硬" % name)
+    _check(u"每个音效长度/峰值/包络都正常", not bad,
+           u"%s" % (bad[:4] if bad else u"全部通过"))
+
+    # 禁用状态：没有声卡时的一切调用都必须安全
+    a = audio_mod.Audio(enabled=False)
+    _check(u"禁用时不初始化 mixer", not a.available and a.volume > 0.0,
+           a.status)
+    _check(u"禁用时播放返回 False 不抛", a.play("coin") is False
+           and a.play("不存在的音效") is False)
+    a.set_volume(0.5)
+    _check(u"禁用时改音量不崩", abs(a.volume - 0.5) < 1e-6)
+    _check(u"静音开关能翻", a.toggle_mute() is True
+           and a.toggle_mute() is False)
+
+
+def test_m10_settings():
+    _section(u"M10 设置：默认值、夹紧、持久化")
+
+    tmp = os.path.join(tempfile.mkdtemp(prefix="pyrun_set_"), "s.json")
+    sv = save_mod.Save(tmp)
+    _check(u"默认音量 7 档", sv.get_setting("sfx") == 7, sv.get_setting("sfx"))
+    _check(u"默认不显示调试", sv.get_setting("show_debug") is False)
+
+    sv.set_setting("sfx", 99)
+    _check(u"超过上限夹到 10", sv.get_setting("sfx") == 10)
+    sv.set_setting("sfx", -5)
+    _check(u"低于下限夹到 0", sv.get_setting("sfx") == 0)
+    sv.set_setting("sfx", 6)
+    sv.set_setting("show_debug", True)
+
+    sv2 = save_mod.Save(tmp)
+    _check(u"设置随存档持久",
+           sv2.get_setting("sfx") == 6
+           and sv2.get_setting("show_debug") is True,
+           u"%s" % (sv2.settings,))
+
+    sv2.clear()
+    _check(u"清档不清设置",
+           sv2.get_setting("sfx") == 6 and sv2.get_setting("show_debug") is True
+           and sv2.cleared_count() == 0)
+
+    # 坏的 settings：坏字段退回默认，好的字段不能跟着丢
+    io_utils.write_text(tmp, u'{"version":1,"settings":'
+                             u'{"sfx":"大声","show_debug":true},"levels":{}}')
+    bad = save_mod.Save(tmp)
+    _check(u"坏的音量退回默认、好的开关保留",
+           bad.get_setting("sfx") == 7 and bad.get_setting("show_debug") is True,
+           u"%s 警告 %s" % (bad.settings, bad.warnings))
+
+    io_utils.write_text(tmp, u'{"version":1,"settings":[1,2],"levels":{}}')
+    bad = save_mod.Save(tmp)
+    _check(u"整块 settings 类型错不崩", bad.get_setting("sfx") == 7
+           and bool(bad.warnings))
+
+
+def test_m10_settings_scene(app):
+    _section(u"M10 设置界面与事件")
+
+    app.save.clear()
+    app.save.set_setting("sfx", 7)
+    app.save.set_setting("show_debug", False)
+    sc = scenes.SettingsScene(app)
+    sc.on_enter()
+    _check(u"三个可编辑项", len(sc.ITEMS) == 3,
+           u"%s" % [k for k, _ in sc.ITEMS])
+
+    sc.index = 0
+    sc._adjust(-1)
+    _check(u"左键降一档音量", app.save.get_setting("sfx") == 6,
+           app.save.get_setting("sfx"))
+    _check(u"音量同步到播放器", abs(app.audio.volume - 0.6) < 0.01,
+           u"vol=%.2f" % app.audio.volume)
+
+    for _ in range(10):
+        sc._adjust(-1)
+    _check(u"按到底停在 0", app.save.get_setting("sfx") == 0,
+           app.save.get_setting("sfx"))
+    for _ in range(14):
+        sc._adjust(1)
+    _check(u"按到顶停在 10", app.save.get_setting("sfx") == 10,
+           app.save.get_setting("sfx"))
+
+    sc.index = 1
+    before = bool(app.save.get_setting("show_debug"))
+    sc._adjust(1)
+    _check(u"调试项能翻转", bool(app.save.get_setting("show_debug")) != before)
+
+    # 画一帧：音量条、开关、设备状态三处都不能抛
+    try:
+        sc.draw(app.screen)
+        ok = True
+        err = ""
+    except Exception as exc:
+        ok = False
+        err = u"%s" % exc
+    _check(u"设置界面能画出来", ok, err)
+
+    sc.handle_event(_key(pygame.K_ESCAPE))
+    _check(u"Esc 回主菜单", app.scenes._pending == "menu",
+           app.scenes._pending)
+    app.scenes._pending = None
+
+    # 玩家事件：音效的输入源
+    w = world.World.load(config.DEFAULT_LEVEL)
+    p = player.Player(*w.spawn)
+    inp = player.InputState()
+    for _ in range(40):
+        p.update(DT, inp, w.collision_solids())
+    _check(u"静置时没有事件", not p.events, u"%s" % (p.events,))
+
+    inp.jump_pressed = True
+    inp.jump_held = True
+    p.update(DT, inp, w.collision_solids())
+    _check(u"起跳报 jump", "jump" in p.events, u"%s" % (p.events,))
+
+    inp.jump_held = False
+    inp.jump_released = True
+    got_land = False
+    for _ in range(120):
+        p.update(DT, inp, w.collision_solids())
+        if "land" in p.events:
+            got_land = True
+            break
+    _check(u"落地报 land", got_land, u"%s" % (p.events,))
+
+    inp.dash_pressed = True
+    p.update(DT, inp, w.collision_solids())
+    _check(u"冲刺报 dash", "dash" in p.events, u"%s" % (p.events,))
+    # 一帧一次：事件不许跨帧累积，否则音效会每帧重放
+    p.update(DT, inp, w.collision_solids())
+    _check(u"事件不跨帧累积", "dash" not in p.events, u"%s" % (p.events,))
+
+
+def test_m10_fx(app):
+    _section(u"M10 粒子与震屏")
+
+    ps = fx_mod.Particles()
+    _check(u"空池不画也不崩", ps.count == 0 and ps.update(DT) is None)
+
+    n = ps.burst("dust", 100, 200)
+    _check(u"扬尘一次出一簇", n > 0 and ps.count == n, u"n=%d" % n)
+
+    _check(u"未知粒子类型直接忽略",
+           ps.burst("不存在的类型", 0, 0) == 0 and ps.count == n)
+
+    ps.burst("debris", 0, 0, )
+    for _ in range(40):
+        ps.burst("spark", 0, 0)
+    _check(u"总数不超过上限", ps.count <= fx_mod.MAX_PARTICLES,
+           u"%d / %d（丢弃 %d）" % (ps.count, fx_mod.MAX_PARTICLES,
+                                   ps.dropped))
+
+    # 重力方向：碎块往下、火星往上。
+    # 碎块刚炸开时是向上飞的（那是"被炸飞"，不是错误），所以不能拿位移
+    # 判方向——要等重力把它翻过来，看末速度。
+    d = fx_mod.Particles()
+    d.burst("debris", 300, 300)
+    for _ in range(14):
+        d.update(DT)
+    _check(u"碎块被重力拽下来",
+           bool(d.items) and all(p[3] > 0.0 for p in d.items),
+           u"vy=%s" % ([round(p[3]) for p in d.items[:3]],))
+
+    e = fx_mod.Particles()
+    e.burst("ember", 300, 300)
+    ey0 = e.items[0][1]
+    for _ in range(3):
+        e.update(DT)
+    _check(u"火星往上飘", all(p[1] < ey0 for p in e.items if p[4] > 0.1),
+           u"y %.1f -> %.1f" % (ey0, e.items[0][1] if e.items else -1))
+
+    # 寿命：跑够长一定清空（不留"永远不消失的粒子"）
+    for _ in range(120):
+        d.update(DT)
+    _check(u"寿命到了会清空", d.count == 0, u"%d 个残留" % d.count)
+
+    try:
+        e.burst("spark", 100, 100)
+        e.draw(app.screen, -50, -50)
+        ok, err = True, ""
+    except Exception as exc:
+        ok, err = False, u"%s" % exc
+    _check(u"粒子能画到屏幕上", ok, err)
+
+    # 震屏：只动绘制偏移，不动相机位置
+    cam = world.Camera((config.WIDTH, config.HEIGHT),
+                       pygame.Rect(0, 0, 4000, 1200))
+    cam.x, cam.y = 800.0, 400.0
+    target = pygame.Rect(1000, 500, 26, 70)
+    cam.update(DT, target)
+    base = (-int(round(cam.x)), -int(round(cam.y)))
+    cam.kick(9.0, 0.20)
+    moved = False
+    for _ in range(8):
+        cam.update(DT, target)
+        if cam.offset != base:
+            moved = True
+    _check(u"震屏让绘制偏移抖动", moved, u"offset=%s base=%s"
+           % (cam.offset, base))
+    _check(u"震屏不改变相机位置",
+           abs(cam.x - (1000 + 13 - config.WIDTH * 0.5)) < 200.0,
+           u"cam.x=%.1f" % cam.x)
+    for _ in range(30):
+        cam.update(DT, target)
+    _check(u"震屏会自己停下", cam.shake_left == 0.0
+           and cam.offset[0] == -int(round(cam.x)),
+           u"offset=%s" % (cam.offset,))
+
+
 # ---------------------------------------------------------------- 入口
 
 def run(app):
@@ -3071,11 +3314,18 @@ def run(app):
     real_save = app.save
     tmp_dir = tempfile.mkdtemp(prefix="pyrun_selftest_")
     app.save = save_mod.Save(os.path.join(tmp_dir, "save.json"))
+    # 自检会把同一个音效播几十次（设置界面试听、金币、死亡）。
+    # 换一个禁用实例，跑完再换回来——理由和上面两条一样：被调用的模块
+    # 不许给玩家留下可听可见的副作用。
+    real_audio = app.audio
+    app.audio = audio_mod.Audio(
+        enabled=False, volume=real_audio.volume if real_audio else 0.7)
     try:
         return _run_all(app)
     finally:
         config.LOG_EVENTS = saved_log
         app.save = real_save
+        app.audio = real_audio
 
 
 def _run_all(app):
@@ -3120,6 +3370,10 @@ def _run_all(app):
     test_m9_select(app)
     test_m9_pause(app)
     test_m9_goal(app)
+    test_m10_audio()
+    test_m10_settings()
+    test_m10_settings_scene(app)
+    test_m10_fx(app)
     test_level_parse()
     test_level_errors()
     test_level_audit()

@@ -22,6 +22,7 @@ import assets
 import compat
 import config
 import dialog
+import fx
 import levels_catalog
 import player
 import world
@@ -277,7 +278,8 @@ class MenuScene(Scene):
             play = u"再玩一次"
         else:
             play = u"继续游戏 · %s" % nxt["name"]
-        return [(play, "play"), (u"选择关卡", "select"), (u"退出游戏", "quit")]
+        return [(play, "play"), (u"选择关卡", "select"),
+                (u"设置", "settings"), (u"退出游戏", "quit")]
 
     def _build_background(self):
         """标题与纸底是静态的，渲染一次缓存起来，每帧只 blit。"""
@@ -310,13 +312,14 @@ class MenuScene(Scene):
         """计算每个菜单项的可点击区域，鼠标与键盘共用同一套坐标。"""
         rects = []
         f_name, _ = get_font(self.ITEM_SIZE)
-        # 三项要算着放：292 + 2*66 + 54 = 478，底部提示条在 500，
-        # 原来按两项写的 300/74 会让"退出游戏"压到提示上。
-        top = 292
-        gap = 66
+        # 四项要算着放：256 + 3*58 + 48 = 478，底部提示条在 500。
+        # 加"设置"这一项时踩过一次：照旧用 292/66 会让"退出游戏"压到
+        # 提示文字上，键盘选中时还能看出来，不选中就是两层灰字叠着。
+        top = 256
+        gap = 58
         for i, (label, _) in enumerate(self.items):
             w = f_name.size(label)[0] + 120
-            h = 54
+            h = 48
             rects.append(pygame.Rect((config.WIDTH - w) // 2, top + i * gap, w, h))
         return rects
 
@@ -325,10 +328,16 @@ class MenuScene(Scene):
             n = len(self.items)
             if event.key in (pygame.K_UP, pygame.K_w):
                 self.index = (self.index - 1) % n
+                self.app.audio.play("ui")
             elif event.key in (pygame.K_DOWN, pygame.K_s):
                 self.index = (self.index + 1) % n
+                self.app.audio.play("ui")
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self.app.audio.play("ui")
                 self._activate()
+            elif event.key == pygame.K_m:
+                if not self.app.audio.toggle_mute():
+                    self.app.audio.play("ui")
             elif event.key == pygame.K_ESCAPE:
                 self.app.quit()
         elif event.type == pygame.MOUSEMOTION:
@@ -361,7 +370,7 @@ class MenuScene(Scene):
                        [label for label, _ in self.items],
                        self.index, f_item)
 
-        hint = u"↑↓ 选择    Enter 确定    Esc 退出"
+        hint = u"↑↓ 选择    Enter 确定    M 静音    Esc 退出"
         hw = f_hint.size(hint)[0]
         surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
                      ((config.WIDTH - hw) // 2, config.HEIGHT - 40))
@@ -514,6 +523,7 @@ class LevelSelectScene(Scene):
         col = self.index % self.COLS
         if 0 <= col + delta < self.COLS:
             self.index += delta
+            self.app.audio.play("ui")
 
     def _move_ud(self, delta):
         n = len(self._cards)
@@ -521,6 +531,7 @@ class LevelSelectScene(Scene):
         # 下一行可能不满（关数是 3 的倍数时不会），落到空位就原地不动
         if 0 <= target < n:
             self.index = target
+            self.app.audio.play("ui")
 
     def _hover(self, pos):
         for i, rect in enumerate(self._cards):
@@ -537,7 +548,10 @@ class LevelSelectScene(Scene):
             prev = levels_catalog.at(self.index - 1)
             self.notice = (u"先通关「%s」" % prev["name"]) if prev else u"尚未解锁"
             self.notice_timer = 1.8
+            # 用低沉的一声代替"滴"：被锁住是"这条路不通"，不是出错。
+            self.app.audio.play("land")
             return False
+        self.app.audio.play("ui")
         return enter_level(self.app, lv["key"])
 
     def update(self, dt):
@@ -642,6 +656,180 @@ class LevelSelectScene(Scene):
                            rect.top + 104))
 
 
+# ---------------------------------------------------------------- 设置场景
+
+class SettingsScene(Scene):
+    """设置。目前只有两项真正能调，但排的是"以后加东西不用改版式"的布局。
+
+    为什么设置页不放进暂停面板：暂停是"我现在要离开一下"，设置是"我要
+    调这台机器"。混在一起，玩家每次想关音效都得先进一关再说。
+    """
+
+    name = "settings"
+
+    TOP = 200
+    GAP = 64
+    ROW_H = 52
+    LABEL_X = 250
+    VALUE_X = 600
+
+    # 可编辑项。音频设备状态那一行是只读的，单独画，不参与选择。
+    ITEMS = [("sfx", u"音效音量"), ("show_debug", u"调试信息"),
+             ("shake", u"画面震动")]
+
+    def __init__(self, app):
+        Scene.__init__(self, app)
+        self.index = 0
+        self._bg = None
+        self._rects = []
+
+    def on_enter(self):
+        self.index = 0
+        self._bg = self._build_background()
+        self._rects = self._build_rects()
+
+    def on_exit(self):
+        self._bg = None
+
+    # ------------------------------------------------------------ 版式
+    def _build_background(self):
+        bg = pygame.Surface((config.WIDTH, config.HEIGHT))
+        draw_paper(bg)
+        f_title, _ = get_font(38, bold=True)
+        title = u"设置"
+        tw = f_title.size(title)[0]
+        bg.blit(f_title.render(title, True, config.COLOR_INK),
+                ((config.WIDTH - tw) // 2, 84))
+        draw_sketch_underline(bg, (config.WIDTH - tw) // 2 + 8,
+                              (config.WIDTH + tw) // 2 - 8, 140)
+        return bg
+
+    def _build_rects(self):
+        rects = []
+        for i in range(len(self.ITEMS)):
+            rects.append(pygame.Rect(self.LABEL_X - 24,
+                                     self.TOP + i * self.GAP,
+                                     self.VALUE_X + 220 - (self.LABEL_X - 24),
+                                     self.ROW_H))
+        return rects
+
+    # ------------------------------------------------------------ 输入
+    def handle_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_UP, pygame.K_w):
+                self.index = (self.index - 1) % len(self.ITEMS)
+                self.app.audio.play("ui")
+            elif event.key in (pygame.K_DOWN, pygame.K_s):
+                self.index = (self.index + 1) % len(self.ITEMS)
+                self.app.audio.play("ui")
+            elif event.key in (pygame.K_LEFT, pygame.K_a):
+                self._adjust(-1)
+            elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                self._adjust(1)
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                key = self.ITEMS[self.index][0]
+                if key == "sfx":
+                    self._adjust(1)
+                else:
+                    self._adjust(1)      # 开关项：任意方向都是翻转
+            elif event.key == pygame.K_m:
+                # 静音是临时开关（不写存档）：玩家按 M 只是"这一会儿别响"。
+                if not self.app.audio.toggle_mute():
+                    self.app.audio.play("ui")
+            elif event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.app.scenes.goto("menu")
+        elif event.type == pygame.MOUSEMOTION:
+            self._hover(event.pos)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._hover(event.pos):
+                if event.pos[0] > self.VALUE_X:
+                    self._adjust(1)
+                else:
+                    self.app.audio.play("ui")
+
+    def _hover(self, pos):
+        for i, rect in enumerate(self._rects):
+            if rect.collidepoint(pos):
+                self.index = i
+                return True
+        return False
+
+    def _adjust(self, delta):
+        key = self.ITEMS[self.index][0]
+        if key == "sfx":
+            v = int(self.app.save.get_setting("sfx")) + delta
+            v = max(0, min(10, v))
+            self.app.save.set_setting("sfx", v)
+            # 音量立刻生效并试听：改音量却要等下一关才知道效果，
+            # 是设置页最没道理的一种体验。
+            self.app.audio.set_volume(v / 10.0)
+            self.app.audio.play("coin")
+        else:
+            cur = bool(self.app.save.get_setting("show_debug"))
+            self.app.save.set_setting("show_debug", not cur)
+            self.app.audio.play("ui")
+
+    # ------------------------------------------------------------ 绘制
+    def draw(self, surface):
+        surface.blit(self._bg, (0, 0))
+        f_label, _ = get_font(24)
+        f_val, _ = get_font(22)
+        f_small, _ = get_font(15)
+        f_hint, _ = get_font(16)
+
+        sv = self.app.save
+        for i, (key, label) in enumerate(self.ITEMS):
+            r = self._rects[i]
+            if i == self.index:
+                pygame.draw.rect(surface, (255, 253, 238), r, 0)
+                pygame.draw.rect(surface, config.COLOR_INK, r, 2)
+            else:
+                pygame.draw.rect(surface, (200, 195, 184), r, 1)
+            surface.blit(f_label.render(label, True, config.COLOR_INK),
+                         (r.left + 24, r.centery - 16))
+
+            if key == "sfx":
+                v = int(sv.get_setting("sfx"))
+                # 十格音量条：数字（7/10）不能让人一眼判断"还剩多少"，
+                # 方块可以。格子的空槽也要画出来，否则 3 档和 10 档看起来
+                # 一样长。
+                for k in range(10):
+                    box = pygame.Rect(self.VALUE_X + k * 15,
+                                      r.centery - 8, 12, 16)
+                    fill = config.COLOR_INK if k < v else (226, 222, 212)
+                    pygame.draw.rect(surface, fill, box, 0)
+                    pygame.draw.rect(surface, (176, 170, 158), box, 1)
+                # 数字去掉空格写成 "7/10"：带空格会顶到面板右边界外，
+                # 截图里"10"整段悬在框外，看着像画错了。
+                txt = u"%d/10" % v
+            else:
+                on = bool(sv.get_setting(key))
+                txt = u"开" if on else u"关"
+                color = config.COLOR_NPC if on else config.COLOR_MUTED
+                # 和上一行的 "7/10" 对齐在同一个 x：两行的值都靠右，
+                # 眼睛扫下来是一条竖线，不会一会在中间一会在右边。
+                surface.blit(f_val.render(txt, True, color),
+                             (self.VALUE_X + 160, r.centery - 15))
+                txt = ""
+            if txt:
+                surface.blit(f_val.render(txt, True, config.COLOR_INK),
+                             (self.VALUE_X + 160, r.centery - 15))
+
+        # 音频设备状态：没有声音时，这一行就是唯一的线索。
+        # 玩家（和我）第一反应都是"是不是没插耳机"，把设备状态写出来，
+        # 能把"没声音"和"音效没接上"分开。
+        y = self.TOP + len(self.ITEMS) * self.GAP + 6
+        status = u"音频设备：%s" % (u"已静音（M）" if self.app.audio.muted
+                                    else self.app.audio.status)
+        surface.blit(f_small.render(status, True, config.COLOR_MUTED),
+                     (self.LABEL_X, y))
+
+        hint = u"↑↓ 选择    ←→ 调整    Enter 切换    Esc 返回"
+        hw = f_hint.size(hint)[0]
+        surface.blit(f_hint.render(hint, True, config.COLOR_MUTED),
+                     ((config.WIDTH - hw) // 2, config.HEIGHT - 40))
+
+
 # ---------------------------------------------------------------- 游戏场景
 
 class GameScene(Scene):
@@ -695,6 +883,11 @@ class GameScene(Scene):
         self._dlg_font = None
         self._dlg_body = None
 
+        # ---- 粒子（M10）----
+        # 粒子池跟场景走，不跟关卡走：重开一关时残留的碎屑几帧就没了，
+        # 没必要为它写清理逻辑（clear 只在 _reset_stats 里顺手清一次）。
+        self.fx = fx.Particles()
+
         # ---- 暂停与结算（M9）----
         # 暂停做成场景内的一个遮罩，而不是切一个新场景：切场景会把
         # world/player 全部丢掉，回来就得重新加载关卡（几十毫秒的烘焙），
@@ -710,7 +903,9 @@ class GameScene(Scene):
     # ---------------------------------------------------------------- 生命周期
     def on_enter(self):
         self.input = player.InputState()
-        self.show_debug = True
+        # 调试面板默认显示与否交给设置（F1 仍然随时临时切换）。
+        # 以前硬编码 True：截图和给别人玩时满屏坐标，很劝退。
+        self.show_debug = bool(self.app.save.get_setting("show_debug"))
         self._focused = True
         self.override_axis = None
         self._reset_stats()
@@ -737,6 +932,10 @@ class GameScene(Scene):
         self.pause_index = 0
         self.new_record = {}
         self.next_key = ""
+        # 换关/重开时把上一局残留的碎屑清掉：不清的话，重开后第一帧会
+        # 在原地看到上一次死亡的黑点，像是"尸体没收拾"。
+        if self.fx is not None:
+            self.fx.clear()
 
     def load_level(self, path):
         """加载关卡。失败时把错误留在 self.load_error 里，画面显示出来。
@@ -1046,6 +1245,9 @@ class GameScene(Scene):
         # 平台先动一步：玩家这一帧要撞的是平台的**新**位置，
         # 否则站在平台前沿时会被追尾，表现为每帧一次的小顿挫。
         self.world.update(dt, self.player)
+        # 粒子在暂停/对话里不推进（上面已经 return），但死亡定格时要继续：
+        # 碎块正在飞的那 0.45 秒里定住，看着像画面卡了。
+        self.fx.update(dt)
         if self.toast_timer > 0.0:
             self.toast_timer = max(0.0, self.toast_timer - dt)
 
@@ -1072,8 +1274,53 @@ class GameScene(Scene):
         self.player.update(dt, self.input, self.world.collision_solids(),
                            oneways=self.world.oneways,
                            bouncers=self.world.bouncers)
+        self._consume_player_events()
         self._post_physics()
         self.camera.update(dt, self.player.rect)
+
+    # 玩家事件 -> 音效。没列进来的事件不发声（宁可少一个音，不要放一个
+    # 和动作对不上的音）。
+    _EVENT_SFX = {
+        "jump": "jump",
+        "land": "land",
+        "dash": "dash",
+        "bounce": "bounce",
+        "stomp": "stomp",
+        "glide": "glide",
+    }
+
+    def _consume_player_events(self):
+        """把 Player 这一帧报上来的一次性事件翻成音效。
+
+        事件由物理层产生（它不知道有没有声卡），这里只做"表现"。顺序保持
+        事件产生的顺序，同帧跳跃+落地不会互相盖掉——同名节流 40ms 已经
+        能兜住真正会叠的情况。
+        """
+        events = self.player.events
+        if not events:
+            return
+        p = self.player
+        for name in events:
+            # 落地与弹跳都在脚下扬一层灰。落地的阈值在 Player 里（落速
+            # 不够不报 event），所以这里可以无条件画，不会走一步扬一次。
+            if name == "land":
+                self._dust(p.rect.centerx, p.rect.bottom - 6)
+            elif name == "bounce":
+                self._dust(p.rect.centerx, p.rect.bottom - 6, 1.3)
+            snd = self._EVENT_SFX.get(name)
+            if snd:
+                self.app.audio.play(snd)
+
+    def _dust(self, x, y, spread=1.0):
+        """脚下扬尘。分左右两簇，而不是一簇居中。
+
+        一簇居中时，角色身体（26px 宽）会把中间那部分整个盖住，剩下几条
+        灰线横在黑色剪影的腰上，看着像"人物身上有划痕"，不像尘土。
+        往两侧各偏 14px 之后，粒子落在身体轮廓外面，才读得出是"落地压起
+        来的灰"。
+        """
+        self.fx.burst("dust", x - 14, y, spread * 0.8)
+        self.fx.burst("dust", x + 14, y, spread * 0.8)
 
     def _apply_platform_carry(self):
         """站着的平台动了，玩家跟着走。
@@ -1145,18 +1392,30 @@ class GameScene(Scene):
                 # 玩家跑到这里根本不知道自己刚刚"存档"了——而这是这关
                 # 最需要知道的一件事。
                 self.toast(u"篝火点燃：这里成了重生点", 1.8)
+                self.app.audio.play("camp")
+                cr = cp["rect"]
+                self.fx.burst("ember", cr.centerx, cr.top + 6, spread=0.6)
 
-        self.world.collect(rect)
+        got = self.world.collect(rect)
+        if got:
+            # 一次吃几枚也只放一个音：节流只能防"同一帧叠五次"，
+            # 但一枚和五枚给同一个音才是对的——玩家想要的反馈是"吃到了"。
+            self.app.audio.play("coin")
+            self.fx.burst("spark", rect.centerx, rect.centery)
 
         # 道具拾取：拿到伞只提示一次，重复踩同一格不会反复弹横幅。
         for item in self.world.collect_items(rect):
             if item == "glider" and p.pick_glider():
                 self.toast(u"获得滑翔伞：空中按住空格可以滑翔", 2.6)
                 print(u" 道具     : 获得滑翔伞（空中按住空格滑翔）")
+                self.app.audio.play("ui")
 
         if rect.colliderect(self.world.goal_zone) and not self.goal_reached:
             self.goal_reached = True
             self.input.release_edges()
+            self.app.audio.play("goal")
+            gz = self.world.goal_zone
+            self.fx.burst("spark", gz.centerx, gz.centery - 30)
             print(u" 到达终点：%.1fs，金币 %d/%d，死亡 %d 次" % (
                 self.level_time, self.world.taken_coins,
                 self.world.total_coins, self.deaths))
@@ -1230,6 +1489,13 @@ class GameScene(Scene):
         if config.LOG_EVENTS and self.world is not None:
             print(u" 死亡 %d：%s（第 %d 列，用时 %.1fs）" % (
                 self.deaths, cause, col, self.level_time))
+        self.app.audio.play("death")
+        self.fx.burst("debris", self.player.rect.centerx,
+                      self.player.rect.centery)
+        # 震屏是"这一下很重"的唯一视觉提示；关掉它的玩家（设置里）也
+        # 不该觉得自己漏了什么——死亡提示面板已经足够醒目。
+        if self.camera is not None and self.app.save.get_setting("shake"):
+            self.camera.kick(7.0, 0.22)
         self.death_timer = config.DEATH_FREEZE
         self.player.vx = 0.0
         self.player.vy = 0.0
@@ -1280,6 +1546,11 @@ class GameScene(Scene):
 
         self.world.draw(surface, self.camera, show_prompt=self.dialog is None)
         self._draw_player(surface)
+        # 粒子画在角色**之后**：扬尘本来就该在脚前面，压在身后会被腿挡住
+        # 大半（实测只剩几个像素混在角色的抗锯齿灰边里，等于没画）。
+        # 碎块盖住角色也不难看——那时角色是灰色定格的，像刚从身上崩下来。
+        ox, oy = self.camera.offset
+        self.fx.draw(surface, ox, oy)
         self._draw_hud(surface)
 
         if (self.show_debug and self.death_timer <= 0.0
