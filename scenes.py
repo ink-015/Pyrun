@@ -1274,8 +1274,20 @@ class GameScene(Scene):
         self.player.update(dt, self.input, self.world.collision_solids(),
                            oneways=self.world.oneways,
                            bouncers=self.world.bouncers)
-        self._consume_player_events()
+        # 关卡左边界是看不见的墙。不夹住的话，站在起点按住左键会走出地图，
+        # 脚下没有地形，直接判"掉出了地图"摔死——玩家只会觉得"我按了下
+        # 左键就死了"。右边不夹：终点在关卡末段，跑过去先结算。
+        if self.player.x < 0.0:
+            self.player.x = 0.0
+            if self.player.vx < 0.0:
+                self.player.vx = 0.0
         self._post_physics()
+        # 消费必须放在 _post_physics **之后**：踩怪是物理判定的一部分
+        # （world.stomp 在 _post_physics 里才跑），它产生的事件如果在这一步
+        # 之前就收走了，就会被下一帧 player.update 开头的 events=[] 抹掉——
+        # 表现是"踩死怪完全没声音"，而且踩怪、被砸这类判定都在后半段，
+        # 少一个音很难联想到是顺序问题。
+        self._consume_player_events()
         self.camera.update(dt, self.player.rect)
 
     # 玩家事件 -> 音效。没列进来的事件不发声（宁可少一个音，不要放一个

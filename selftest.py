@@ -42,6 +42,30 @@ def _section(title):
     print(u"--- %s ---" % title)
 
 
+class _Recorder(object):
+    """顶替 app.audio 的记录器：只记"谁被要求发声"，不碰声卡。
+
+    自检要能验证"某个动作有没有音效"这件事本身，而不是"音效文件好不好听"。
+    无头环境里真去 mixer.play 会让断言取决于机器有没有声卡，那种测试
+    在 CI 上永远是绿的，也就永远发现不了漏接。
+    """
+
+    def __init__(self):
+        self.played = []
+        self.status = u"(记录器)"
+        self.available = False
+
+    def play(self, name, force=False):
+        self.played.append(name)
+        return True
+
+    def set_volume(self, ratio):
+        pass
+
+    def toggle_mute(self):
+        return False
+
+
 # ---------------------------------------------------------------- 世界构造
 
 def _flat():
@@ -2046,13 +2070,23 @@ def test_m7_scene(app):
     scene.player.teleport(wk.cx - W * 0.5, wk.ground_y - H - 60)
     scene.invuln = 0.0
     scene.override_axis = 0.0
+    # 踩怪的音效走的是"物理判定 -> 事件 -> 表现"这条路。事件在
+    # _post_physics 里才产生，如果消费早于它，这一帧就白踩了。
+    rec = _Recorder()
+    real_audio = app.audio
+    app.audio = rec
     frames = 0
-    while not scene.player.stomp_count and frames < 60:
-        scene.update(DT)
-        frames += 1
+    try:
+        while not scene.player.stomp_count and frames < 60:
+            scene.update(DT)
+            frames += 1
+    finally:
+        app.audio = real_audio
     _check(u"落到头顶能踩死", scene.player.stomp_count == 1,
            u"%d 帧后踩中 %d 次（state=%s）"
            % (frames, scene.player.stomp_count, wk.state))
+    _check(u"踩怪有音效", "stomp" in rec.played,
+           u"踩中那几帧播了 %s" % (rec.played,))
     _check(u"踩死时玩家还在（不是同归于尽）", scene.deaths == 0,
            u"死亡 %d 次：%s" % (scene.deaths, scene.last_death_cause))
     _check(u"踩完被弹起来", scene.player.vy < 0,
@@ -3217,6 +3251,28 @@ def test_m10_settings_scene(app):
     _check(u"事件不跨帧累积", "dash" not in p.events, u"%s" % (p.events,))
 
 
+def test_m10_left_wall(app):
+    _section(u"M10 关卡左边界")
+
+    scene = scenes.GameScene(app)
+    scene.on_enter()
+    scene.load_level(levels_catalog.path_of("l1"))
+    if scene.world is None:
+        _check(u"l1 可加载", False, scene.load_error)
+        return
+    # 站到起点，一直按住左键跑 1.5 秒：这里必须被"看不见的墙"挡住。
+    scene.override_axis = -1.0
+    for _ in range(90):
+        scene.update(DT)
+    _check(u"按住左键不会走出地图", scene.player.x >= 0.0,
+           u"x=%.1f" % scene.player.x)
+    _check(u"按住左键不会摔死", scene.deaths == 0,
+           u"死亡 %d 次：%s" % (scene.deaths, scene.last_death_cause))
+    _check(u"贴墙时水平速度不反向", scene.player.vx >= 0.0,
+           u"vx=%.1f" % scene.player.vx)
+    scene.override_axis = 0.0
+
+
 def test_m10_fx(app):
     _section(u"M10 粒子与震屏")
 
@@ -3249,11 +3305,16 @@ def test_m10_fx(app):
 
     e = fx_mod.Particles()
     e.burst("ember", 300, 300)
-    ey0 = e.items[0][1]
+    # 每个粒子有自己的随机起点，所以只能"自己跟自己比"。之前拿全都跟
+    # 第 0 个粒子的起点比，只要有一颗粒子出生时偏低十几像素，就算它
+    # 确实在往上飘也会判失败——这是一条会随机变红的假测试。
+    before = [(id(p), p[1]) for p in e.items]
     for _ in range(3):
         e.update(DT)
-    _check(u"火星往上飘", all(p[1] < ey0 for p in e.items if p[4] > 0.1),
-           u"y %.1f -> %.1f" % (ey0, e.items[0][1] if e.items else -1))
+    now = dict((id(p), p[1]) for p in e.items)
+    rose = [now[i] < y0 for i, y0 in before if i in now]
+    _check(u"火星往上飘", rose and all(rose),
+           u"%d/%d 颗上升" % (len([r for r in rose if r]), len(rose)))
 
     # 寿命：跑够长一定清空（不留"永远不消失的粒子"）
     for _ in range(120):
@@ -3373,6 +3434,7 @@ def _run_all(app):
     test_m10_audio()
     test_m10_settings()
     test_m10_settings_scene(app)
+    test_m10_left_wall(app)
     test_m10_fx(app)
     test_level_parse()
     test_level_errors()
