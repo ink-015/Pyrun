@@ -72,10 +72,6 @@ class App(object):
         # 背景音乐。同样先给一个禁用实例：自检与截图脚本 new App() 时
         # 不该去开音频设备，也不该因为少这行在场景里抛 AttributeError。
         self.music = music_mod.Music(enabled=False)
-        # 连续挑战的累计成绩（从主菜单"开始游戏"起，到回菜单/关窗口止）。
-        # 放在 App 上而不是 GameScene 上：换关时 GameScene 会重建，累计值
-        # 必须活过场景切换。
-        self.run_state = None
         self.running = True
 
     def quit(self):
