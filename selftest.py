@@ -22,6 +22,7 @@ import enemy
 import fx as fx_mod
 import io_utils
 import levels_catalog
+import music as music_mod
 import player
 import save as save_mod
 import scenes
@@ -3181,8 +3182,10 @@ def test_m10_settings_scene(app):
     app.save.set_setting("show_debug", False)
     sc = scenes.SettingsScene(app)
     sc.on_enter()
-    _check(u"三个可编辑项", len(sc.ITEMS) == 3,
+    _check(u"四个可编辑项", len(sc.ITEMS) == 4,
            u"%s" % [k for k, _ in sc.ITEMS])
+    _check(u"数值项只有音量两项", sc.NUMERIC == ("sfx", "music"),
+           u"%s" % (sc.NUMERIC,))
 
     sc.index = 0
     sc._adjust(-1)
@@ -3200,10 +3203,29 @@ def test_m10_settings_scene(app):
     _check(u"按到顶停在 10", app.save.get_setting("sfx") == 10,
            app.save.get_setting("sfx"))
 
+    # 音乐那一格：改的是 music，不该顺手把 sfx 也改了
     sc.index = 1
+    sc._adjust(-1)
+    _check(u"音乐音量独立成档", app.save.get_setting("music") == 5
+           and app.save.get_setting("sfx") == 10,
+           u"music=%s sfx=%s" % (app.save.get_setting("music"),
+                                app.save.get_setting("sfx")))
+
+    # 开关项必须按自己的 key 翻转。这里曾经写死 show_debug，
+    # 点"画面震动"实际改的是调试面板。
+    sc.index = 2
     before = bool(app.save.get_setting("show_debug"))
     sc._adjust(1)
     _check(u"调试项能翻转", bool(app.save.get_setting("show_debug")) != before)
+    shake_before = bool(app.save.get_setting("shake"))
+    debug_before = bool(app.save.get_setting("show_debug"))
+    sc.index = 3
+    sc._adjust(1)
+    _check(u"震动项改的是自己", bool(app.save.get_setting("shake"))
+           != shake_before
+           and bool(app.save.get_setting("show_debug")) == debug_before,
+           u"shake=%s debug=%s" % (app.save.get_setting("shake"),
+                                   app.save.get_setting("show_debug")))
 
     # 画一帧：音量条、开关、设备状态三处都不能抛
     try:
@@ -3249,6 +3271,113 @@ def test_m10_settings_scene(app):
     # 一帧一次：事件不许跨帧累积，否则音效会每帧重放
     p.update(DT, inp, w.collision_solids())
     _check(u"事件不跨帧累积", "dash" not in p.events, u"%s" % (p.events,))
+
+
+class _MusicRecorder(object):
+    """顶替 app.music：只记"谁要求放什么"，不碰设备。
+
+    和 _Recorder 同理——自检要验证的是"暂停时音乐有没有停"这类接线，
+    而不是"这台机器有没有声卡"。
+    """
+
+    def __init__(self):
+        self.played = []
+        self.paused = 0
+        self.resumed = 0
+        self.volume = 0.6
+        self.status = u"(记录器)"
+
+    def play(self, name):
+        self.played.append(name)
+        return True
+
+    def pause(self):
+        self.paused += 1
+
+    def resume(self):
+        self.resumed += 1
+
+    def stop(self, fade_ms=0):
+        pass
+
+    def set_volume(self, ratio):
+        self.volume = ratio
+
+    def toggle_mute(self):
+        return False
+
+
+def test_m10_music(app):
+    _section(u"M10 背景音乐")
+
+    names = music_mod.track_names()
+    _check(u"两首曲子都登记了", names == ["game", "menu"], u"%s" % (names,))
+
+    bad = []
+    for name in names:
+        path = music_mod.track_path(name)
+        if not os.path.exists(path):
+            bad.append(u"%s 缺文件" % name)
+        elif os.path.getsize(path) < 100 * 1024:
+            bad.append(u"%s 只有 %d 字节" % (name, os.path.getsize(path)))
+    _check(u"曲目文件都在且不是空壳", not bad, u"%s" % (bad or u"全部就位"))
+
+    _check(u"授权说明在仓库里",
+           os.path.exists(os.path.join(config.ASSET_DIR, "audio",
+                                       "CREDITS.md")))
+
+    # 没有设备 / 关掉时的一切调用都必须安全，而且不能把曲目名丢掉
+    m = music_mod.Music(enabled=False)
+    _check(u"禁用时不初始化 mixer", not m.available and m.volume > 0.0,
+           m.status)
+    _check(u"禁用时播放返回 False 不抛", m.play("game") is False
+           and m.play("不存在") is False)
+    _check(u"禁用时仍记住该放哪首", m.track == "game", u"track=%s" % m.track)
+    m.set_volume(0.5)
+    _check(u"禁用时改音量不崩", abs(m.volume - 0.5) < 1e-6)
+    _check(u"静音开关能翻", m.toggle_mute() is True
+           and m.toggle_mute() is False)
+    m.pause()
+    m.resume()
+    m.stop()
+    _check(u"暂停/继续/停止在无设备时都是空操作", True)
+
+    # 音量夹紧
+    m2 = music_mod.Music(enabled=False)
+    m2.set_volume(5.0)
+    hi = m2.volume
+    m2.set_volume(-5.0)
+    lo = m2.volume
+    _check(u"音量夹在 0~1", abs(hi - 1.0) < 1e-6 and abs(lo) < 1e-6,
+           u"%.2f / %.2f" % (hi, lo))
+
+    # ---- 接线：进关换曲、暂停停、继续续 ----
+    rec = _MusicRecorder()
+    real = app.music
+    app.music = rec
+    try:
+        sc = scenes.GameScene(app)
+        sc.on_enter()
+        sc.load_level(levels_catalog.path_of("l1"))
+        _check(u"进关切到游戏曲", rec.played[:1] == ["game"],
+               u"%s" % (rec.played,))
+        sc._open_pause()
+        _check(u"打开暂停时音乐停", rec.paused == 1, u"paused=%d" % rec.paused)
+        sc.pause_index = 0
+        sc._activate_pause()
+        _check(u"继续游戏时音乐续播", rec.resumed == 1,
+               u"resumed=%d" % rec.resumed)
+        sc._open_pause()
+        sc.handle_event(_key(pygame.K_ESCAPE))
+        _check(u"Esc 关暂停也续播", rec.resumed == 2 and not sc.paused,
+               u"resumed=%d paused=%s" % (rec.resumed, sc.paused))
+
+        menu = scenes.MenuScene(app)
+        menu.on_enter()
+        _check(u"主菜单切到菜单曲", rec.played[-1] == "menu",
+               u"%s" % (rec.played[-3:],))
+    finally:
+        app.music = real
 
 
 def test_m10_left_wall(app):
@@ -3434,6 +3563,7 @@ def _run_all(app):
     test_m10_audio()
     test_m10_settings()
     test_m10_settings_scene(app)
+    test_m10_music(app)
     test_m10_left_wall(app)
     test_m10_fx(app)
     test_level_parse()

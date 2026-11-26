@@ -107,6 +107,17 @@ class Scene(object):
     def on_exit(self):
         """离开场景时调用一次，适合释放缓存。"""
 
+    def _toggle_mute(self):
+        """M：音效和音乐一起静音。
+
+        不拆成两个键：玩家按 M 的动机是"这一会儿别出声"，分两个键的结果
+        是永远只记得住一个，另一个一直在偷偷响。
+        """
+        muted = self.app.audio.toggle_mute()
+        self.app.music.toggle_mute()
+        if not muted:
+            self.app.audio.play("ui")
+
     def handle_event(self, event):
         """处理单个事件。"""
 
@@ -264,6 +275,9 @@ class MenuScene(Scene):
         self.items = self._build_items()
         self._bg = self._build_background()
         self._item_rects = self._build_item_rects()
+        # 菜单与选关共用一首：两首都在 60 秒级，来回切会像"电台跳台"，
+        # 而且玩家在这两个界面停留很短，重新起播反而更明显的断点。
+        self.app.music.play("menu")
 
     def on_exit(self):
         self._bg = None
@@ -336,8 +350,7 @@ class MenuScene(Scene):
                 self.app.audio.play("ui")
                 self._activate()
             elif event.key == pygame.K_m:
-                if not self.app.audio.toggle_mute():
-                    self.app.audio.play("ui")
+                self._toggle_mute()
             elif event.key == pygame.K_ESCAPE:
                 self.app.quit()
         elif event.type == pygame.MOUSEMOTION:
@@ -406,6 +419,7 @@ class LevelSelectScene(Scene):
     def on_enter(self):
         self._bg = self._build_background()
         self._cards = self._build_cards()
+        self.app.music.play("menu")
         self.notice = ""
         self.notice_timer = 0.0
         # Delete 清档要按两次。一次就清的话，手滑一下十年进度没了。
@@ -674,8 +688,10 @@ class SettingsScene(Scene):
     VALUE_X = 600
 
     # 可编辑项。音频设备状态那一行是只读的，单独画，不参与选择。
-    ITEMS = [("sfx", u"音效音量"), ("show_debug", u"调试信息"),
-             ("shake", u"画面震动")]
+    ITEMS = [("sfx", u"音效音量"), ("music", u"音乐音量"),
+             ("show_debug", u"调试信息"), ("shake", u"画面震动")]
+    # 数值项（带十格条），其余是开关项。
+    NUMERIC = ("sfx", "music")
 
     def __init__(self, app):
         Scene.__init__(self, app)
@@ -727,15 +743,10 @@ class SettingsScene(Scene):
             elif event.key in (pygame.K_RIGHT, pygame.K_d):
                 self._adjust(1)
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
-                key = self.ITEMS[self.index][0]
-                if key == "sfx":
-                    self._adjust(1)
-                else:
-                    self._adjust(1)      # 开关项：任意方向都是翻转
+                self._adjust(1)
             elif event.key == pygame.K_m:
                 # 静音是临时开关（不写存档）：玩家按 M 只是"这一会儿别响"。
-                if not self.app.audio.toggle_mute():
-                    self.app.audio.play("ui")
+                self._toggle_mute()
             elif event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
                 self.app.scenes.goto("menu")
         elif event.type == pygame.MOUSEMOTION:
@@ -756,17 +767,23 @@ class SettingsScene(Scene):
 
     def _adjust(self, delta):
         key = self.ITEMS[self.index][0]
-        if key == "sfx":
-            v = int(self.app.save.get_setting("sfx")) + delta
+        if key in self.NUMERIC:
+            v = int(self.app.save.get_setting(key)) + delta
             v = max(0, min(10, v))
-            self.app.save.set_setting("sfx", v)
+            self.app.save.set_setting(key, v)
             # 音量立刻生效并试听：改音量却要等下一关才知道效果，
-            # 是设置页最没道理的一种体验。
-            self.app.audio.set_volume(v / 10.0)
-            self.app.audio.play("coin")
+            # 是设置页最没道理的一种体验。音乐不放提示音——那一格调的是
+            # 音乐本身，加一声"叮"只会让人分不清听到的是哪个。
+            if key == "sfx":
+                self.app.audio.set_volume(v / 10.0)
+                self.app.audio.play("coin")
+            else:
+                self.app.music.set_volume(v / 10.0)
         else:
-            cur = bool(self.app.save.get_setting("show_debug"))
-            self.app.save.set_setting("show_debug", not cur)
+            # 以前这里写死了 "show_debug"：点"画面震动"实际改的是调试面板，
+            # 屏幕上那一行纹丝不动，玩家会以为方向键坏了。
+            cur = bool(self.app.save.get_setting(key))
+            self.app.save.set_setting(key, not cur)
             self.app.audio.play("ui")
 
     # ------------------------------------------------------------ 绘制
@@ -788,8 +805,8 @@ class SettingsScene(Scene):
             surface.blit(f_label.render(label, True, config.COLOR_INK),
                          (r.left + 24, r.centery - 16))
 
-            if key == "sfx":
-                v = int(sv.get_setting("sfx"))
+            if key in self.NUMERIC:
+                v = int(sv.get_setting(key))
                 # 十格音量条：数字（7/10）不能让人一眼判断"还剩多少"，
                 # 方块可以。格子的空槽也要画出来，否则 3 档和 10 档看起来
                 # 一样长。
@@ -819,8 +836,11 @@ class SettingsScene(Scene):
         # 玩家（和我）第一反应都是"是不是没插耳机"，把设备状态写出来，
         # 能把"没声音"和"音效没接上"分开。
         y = self.TOP + len(self.ITEMS) * self.GAP + 6
-        status = u"音频设备：%s" % (u"已静音（M）" if self.app.audio.muted
-                                    else self.app.audio.status)
+        # 两行状态并成一行：设备问题、静音、音量，三件事玩家一眼要能分开。
+        # 以前只报音效，音乐没声音时这里显示"可用"，反而更迷惑。
+        status = u"设备：%s    音效：%d    音乐：%d" % (
+            u"已静音（M）" if self.app.audio.muted else self.app.audio.status,
+            int(sv.get_setting("sfx")), int(sv.get_setting("music")))
         surface.blit(f_small.render(status, True, config.COLOR_MUTED),
                      (self.LABEL_X, y))
 
@@ -966,6 +986,9 @@ class GameScene(Scene):
             return False
 
         print(u" 关卡     : %s" % self.world.describe())
+        # 同一首正在播时 play() 什么都不做：换关不该把音乐从头打断，
+        # 连续挑战时每关重起一遍前奏是很明显的断点。
+        self.app.music.play("game")
         self.player = player.Player(*self.world.spawn)
         self.camera = world.Camera((config.WIDTH, config.HEIGHT),
                                    self.world.bounds)
@@ -1090,6 +1113,8 @@ class GameScene(Scene):
     def _open_pause(self):
         self.paused = True
         self.pause_index = 0
+        # 暂停就真的停：音乐还在响、画面却定住，玩家会以为游戏卡了。
+        self.app.music.pause()
         # 打开菜单的瞬间清掉按键边沿与水平速度：否则关掉暂停的那一帧，
         # 角色会带着"按着右键"和"待处理的跳跃"冲出去。
         self.input.release_edges()
@@ -1107,6 +1132,7 @@ class GameScene(Scene):
             self._activate_pause()
         elif key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
             self.paused = False
+            self.app.music.resume()
 
     def _pause_item_rects(self):
         """暂停面板的按钮矩形。面板位置固定，矩形可以每次算——一共四项，
@@ -1136,6 +1162,10 @@ class GameScene(Scene):
     def _activate_pause(self):
         _, action = self.PAUSE_ITEMS[self.pause_index]
         self.paused = False
+        # 回游戏/重开要接着放；回选关或主菜单不用管——那些场景 on_enter
+        # 会切菜单曲。
+        if action in ("resume", "restart"):
+            self.app.music.resume()
         if action == "resume":
             return
         if action == "restart":

@@ -21,9 +21,9 @@ M3 内容：关卡文件（world.py + levels/l1.txt）、相机跟随、HUD 与�
     python main.py --smoke-m7      第 5 关：踩怪 / 刺轮 / 荡锤 / 空中伞四张图
     python main.py --smoke-m8      第 6 关：伪装砖 / 落刺 / 突墙 / 二连石四张图
     python main.py --smoke-m9      界面四张图：主菜单 / 选关 / 暂停 / 结算
-    python main.py --smoke-m10     界面三张图：主菜单（四项）/ 设置 / 音量调到 0
+    python main.py --smoke-m10     界面三张图：主菜单（四项）/ 设置 / 音效音乐都调到 0
     python main.py --smoke-fx      M10 粒子两张图：落地扬尘 / 死亡碎块
-    python main.py --no-audio      不开音效（排查"没声音"是设备问题还是接入问题）
+    python main.py --no-audio      不开音效与音乐（排查"没声音"是设备问题还是接入问题）
     python main.py --level l2      直接进入指定关卡（文件名不含 .txt）
     python main.py --smoke-assets  渲染 M0 素材验证画面并截图
     python main.py --smoke-anim    按游戏内比例摊开所有角色帧，核对锚点
@@ -43,6 +43,7 @@ import pygame
 
 import assets
 import audio as audio_mod
+import music as music_mod
 import compat
 import config
 import levels_catalog
@@ -68,6 +69,9 @@ class App(object):
         # 默认给一个"禁用"的实例：自检与截图脚本会自己 new App()，它们
         # 不该因为少了一行初始化就在 die() 里抛 AttributeError。
         self.audio = audio_mod.Audio(enabled=False)
+        # 背景音乐。同样先给一个禁用实例：自检与截图脚本 new App() 时
+        # 不该去开音频设备，也不该因为少这行在场景里抛 AttributeError。
+        self.music = music_mod.Music(enabled=False)
         # 连续挑战的累计成绩（从主菜单"开始游戏"起，到回菜单/关窗口止）。
         # 放在 App 上而不是 GameScene 上：换关时 GameScene 会重建，累计值
         # 必须活过场景切换。
@@ -339,6 +343,12 @@ def main():
         enabled=(not readonly) and "--no-audio" not in sys.argv,
         volume=app.save.get_setting("sfx") / 10.0)
     print(u" 音效     :", app.audio.status)
+    # 音乐单独一档音量：音乐比音效"吵"得多，合成音效和 70 秒的曲子
+    # 共用一个滑块，结果只能是音效小得听不见或音乐盖住音效。
+    app.music = music_mod.Music(
+        enabled=(not readonly) and "--no-audio" not in sys.argv,
+        volume=app.save.get_setting("music") / 10.0)
+    print(u" 音乐     :", app.music.status)
     app.scenes = scenes.SceneManager(app)
     app.scenes.register("menu", scenes.MenuScene)
     app.scenes.register("select", scenes.LevelSelectScene)
@@ -844,7 +854,9 @@ def main():
         print(" 截图   :", save_screenshot(screen, "m10_settings.png"))
 
         app.save.set_setting("sfx", 0)
+        app.save.set_setting("music", 0)
         app.audio.set_volume(0.0)
+        app.music.set_volume(0.0)
         sc.draw(screen)
         pygame.display.flip()
         print(" 截图   :", save_screenshot(screen, "m10_settings_mute.png"))
